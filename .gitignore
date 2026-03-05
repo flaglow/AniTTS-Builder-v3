@@ -18,5 +18,12 @@
 *.mkv
 *.wmv
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+*$py.class
 *.pyo
+*.pyd
+
+data*
+
+*.ckpt

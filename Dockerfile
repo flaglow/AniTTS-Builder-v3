@@ -20,11 +20,9 @@ RUN apt-get clean && \
     apt-get clean && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
-# Clone the AniTTS-Builder-v3 repository
-RUN git clone https://github.com/N01N9/AniTTS-Builder-v3.git
-
-# Set working directory to the cloned repository
+# Use local project source from build context
 WORKDIR /workspace/AniTTS-Builder-v3
+COPY . /workspace/AniTTS-Builder-v3
 
 # Install Python dependencies
 RUN pip install --upgrade pip && \

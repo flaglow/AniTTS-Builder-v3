@@ -1,0 +1,26 @@
+# Git metadata
+.git
+.gitignore
+
+# Python/cache artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Local virtual environments
+.venv/
+venv/
+
+# Runtime/generated data (mounted at runtime)
+data/
+data_*/
+
+# Large model artifacts (mounted at runtime)
+module/model/
+
+# OS/editor files
+.DS_Store
+Thumbs.db

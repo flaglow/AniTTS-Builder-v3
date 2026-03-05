@@ -15,15 +15,37 @@
 
 This program is developed to run through dockers. Please install CUDA 12.1 + CUDNN 9.X versions and Docker.
 
-1. Install Docker and CUDA 12.1 + CUDNN 9.X version.
-   
-2. Clone the repositories using the following command : "git clone https://github.com/N01N9/AniTTS-Builder-v3.git". If git is not installed, download the zip file and unzip it. 
-   
-3. Run the setup.bat file.
-   
-4. Run the start.bat file and please enter the project name consisting of English and numbers only.
+### Windows
 
-5. When the docker container is up, type: "python main.py"
+1. Install Docker and CUDA 12.1 + CUDNN 9.X version.
+2. Clone the repositories using the following command : `git clone https://github.com/N01N9/AniTTS-Builder-v3.git`. If git is not installed, download the zip file and unzip it.
+3. Run the `setup.bat` file.
+4. Run the `start.bat` file and please enter the project name consisting of English and numbers only.
+5. When the docker container is up, type: `python main.py`
+
+### Linux / WSL (Ubuntu)
+
+1. Install Docker and CUDA 12.1 + CUDNN 9.X version on your Linux / WSL environment.
+2. Make sure Docker can use GPU (install `nvidia-container-toolkit` and enable GPU support for Docker).
+3. Clone the repositories:
+   ```bash
+   git clone https://github.com/N01N9/AniTTS-Builder-v3.git
+   cd AniTTS-Builder-v3
+   ```
+4. (First time only) Build the Docker image:
+   ```bash
+   chmod +x setup.sh start.sh
+   ./setup.sh
+   ```
+5. Start the container and create a data folder (e.g. `data_myproject`):
+   ```bash
+   ./start.sh
+   ```
+   - When prompted, enter a folder suffix using only English letters and numbers (e.g. `myproject`).
+6. After the Docker container starts and you see a shell prompt inside the container, run:
+   ```bash
+   python main.py
+   ```
    
 ## Usage
 
