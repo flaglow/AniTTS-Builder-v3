@@ -38,8 +38,12 @@ This program is developed to run through dockers. Please install CUDA 12.1 + CUD
    ./setup.sh
    ```
    - Optional:
-     - `INSTALL_CUML=0 ./setup.sh` (skip cuML install)
+     - `INSTALL_CUML=1 ./setup.sh` (force cuML install)
+     - `INSTALL_CUML=0 ./setup.sh` (force skip cuML install)
      - `NO_CACHE=1 ./setup.sh` (build without Docker cache)
+   - Default behavior:
+     - If GPU is detected (`nvidia-smi` available), `INSTALL_CUML=1`.
+     - If GPU is not detected, `INSTALL_CUML=0` for compatibility.
 5. Start the container and create a data folder (e.g. `data_myproject`):
    ```bash
    ./start.sh myproject
