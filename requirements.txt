@@ -112,6 +112,7 @@ Pygments==2.19.1
 pyparsing==3.2.1
 pyproject_hooks==1.2.0
 PySocks==1.7.1
+pysubs2==1.8.0
 pystoi==0.4.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1

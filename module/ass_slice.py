@@ -19,6 +19,22 @@ non_dialogue_style_pattern = re.compile(
 )
 smi_sync_pattern = re.compile(r"(?is)<sync\b[^>]*?start\s*=\s*(\d+)[^>]*>")
 smi_class_pattern = re.compile(r"(?is)<p\b[^>]*?class\s*=\s*['\"]?([^'\"\s>]+)")
+SUBTITLE_PRIORITY_EXTS = (".ass", ".srt", ".smi")
+
+SRT_ENCODING_CANDIDATES = (
+    "utf-8-sig",
+    "utf-8",
+    "cp949",
+    "euc-kr",
+    "utf-16",
+)
+SMI_ENCODING_CANDIDATES = (
+    "cp949",
+    "euc-kr",
+    "utf-16",
+    "utf-8-sig",
+    "utf-8",
+)
 
 def ass_time_to_sec(t: str) -> float:
     m = ass_time_pattern.match(t.strip())
@@ -44,7 +60,15 @@ def _safe_float(value, default=0.0):
 
 
 def _read_text_file(path: str) -> str:
-    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+    for enc in (
+        "utf-8-sig",
+        "utf-8",
+        "cp949",
+        "euc-kr",
+        "utf-16",
+        "utf-16-le",
+        "utf-16-be",
+    ):
         try:
             with open(path, "r", encoding=enc) as f:
                 return f.read()
@@ -249,6 +273,108 @@ def parse_smi_dialogues(path):
     return _parse_smi_dialogues_from_text(_read_text_file(path))
 
 
+def _convert_to_ass_with_pysubs2(input_path: str, ass_path: str, encodings):
+    try:
+        import pysubs2
+    except Exception:
+        return False, "pysubs2_not_installed"
+
+    subtitle_obj = None
+    for encoding in encodings:
+        try:
+            subtitle_obj = pysubs2.load(input_path, encoding=encoding)
+            break
+        except Exception:
+            continue
+
+    if subtitle_obj is None:
+        try:
+            subtitle_obj = pysubs2.load(input_path)
+        except Exception:
+            return False, "load_failed"
+
+    events = getattr(subtitle_obj, "events", None)
+    if not events:
+        return False, "no_dialogues"
+
+    try:
+        subtitle_obj.save(ass_path, format_="ass")
+    except Exception:
+        return False, "save_failed"
+
+    return True, "converted"
+
+
+def srt_to_ass(srt_path: str, ass_path: str):
+    return _convert_to_ass_with_pysubs2(
+        input_path=srt_path,
+        ass_path=ass_path,
+        encodings=SRT_ENCODING_CANDIDATES,
+    )
+
+
+def smi_to_ass(smi_path: str, ass_path: str):
+    return _convert_to_ass_with_pysubs2(
+        input_path=smi_path,
+        ass_path=ass_path,
+        encodings=SMI_ENCODING_CANDIDATES,
+    )
+
+
+def ensure_ass_from_srt(srt_path: str, ass_path: str):
+    return srt_to_ass(srt_path=srt_path, ass_path=ass_path)
+
+
+def ensure_ass_from_smi(smi_path: str, ass_path: str):
+    return smi_to_ass(smi_path=smi_path, ass_path=ass_path)
+
+
+def _build_subtitle_jobs(subtitle_dir: str):
+    by_base = {}
+    for subtitle_name in sorted(os.listdir(subtitle_dir)):
+        ext = os.path.splitext(subtitle_name)[1].lower()
+        if ext not in SUPPORTED_SUBTITLE_EXTS:
+            continue
+        base = os.path.splitext(subtitle_name)[0]
+        by_base.setdefault(base, {})
+        by_base[base].setdefault(ext, subtitle_name)
+
+    jobs = []
+    for base in sorted(by_base):
+        variants = by_base[base]
+        if ".ass" in variants:
+            jobs.append(
+                {
+                    "base": base,
+                    "selected_name": variants[".ass"],
+                    "selected_ext": ".ass",
+                    "source": "existing_ass",
+                }
+            )
+            continue
+        if ".srt" in variants:
+            jobs.append(
+                {
+                    "base": base,
+                    "selected_name": variants[".srt"],
+                    "selected_ext": ".srt",
+                    "source": "existing_srt",
+                }
+            )
+            continue
+        if ".smi" in variants:
+            jobs.append(
+                {
+                    "base": base,
+                    "selected_name": variants[".smi"],
+                    "selected_ext": ".smi",
+                    "source": "existing_smi",
+                }
+            )
+            continue
+    return jobs
+
+
 def parse_subtitle_dialogues(path):
     text = _read_text_file(path)
     subtitle_format = detect_subtitle_format(path, sample_text=text[:20000])
@@ -267,9 +393,19 @@ def run_ass_slice(
     os.makedirs(ASS_DIR, exist_ok=True)
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    subtitle_files = [f for f in os.listdir(ASS_DIR) if os.path.splitext(f)[1].lower() in SUPPORTED_SUBTITLE_EXTS]
+    subtitle_files = [
+        f
+        for f in os.listdir(ASS_DIR)
+        if os.path.splitext(f)[1].lower() in SUPPORTED_SUBTITLE_EXTS
+    ]
     subtitle_files.sort()
     print(f"Found {len(subtitle_files)} subtitle files ({', '.join(SUPPORTED_SUBTITLE_EXTS)}).")
+    subtitle_jobs = _build_subtitle_jobs(ASS_DIR)
+    print(
+        "[INFO] Subtitle selection policy: "
+        f"{' > '.join(ext[1:] for ext in SUBTITLE_PRIORITY_EXTS)} "
+        f"(selected={len(subtitle_jobs)})"
+    )
     print(
         "[INFO] Slice options: "
         f"dry_run={dry_run}, auto_filter_non_dialogue={auto_filter_non_dialogue}"
@@ -278,11 +414,31 @@ def run_ass_slice(
     global_idx = 0
     total_slices = 0
 
-    for subtitle_name in subtitle_files:
-        base = os.path.splitext(subtitle_name)[0]
+    for job in subtitle_jobs:
+        base = job["base"]
+        subtitle_name = job["selected_name"]
+        subtitle_path = os.path.join(ASS_DIR, subtitle_name)
+        source = job["source"]
+
+        if job["selected_ext"] in (".smi", ".srt"):
+            converted_ass_name = base + ".ass"
+            converted_ass_path = os.path.join(ASS_DIR, converted_ass_name)
+            if job["selected_ext"] == ".smi":
+                converted, reason = ensure_ass_from_smi(subtitle_path, converted_ass_path)
+                source = "converted_smi_to_ass"
+            else:
+                converted, reason = ensure_ass_from_srt(subtitle_path, converted_ass_path)
+                source = "converted_srt_to_ass"
+            if not converted:
+                print(
+                    f"[WARN] Failed to convert subtitle to ASS: {subtitle_name} ({reason}), skip."
+                )
+                continue
+            subtitle_name = converted_ass_name
+            subtitle_path = converted_ass_path
+
         wav_name = base + ".wav"
         wav_path = os.path.join(AUDIO_DIR, wav_name)
-        subtitle_path = os.path.join(ASS_DIR, subtitle_name)
 
         if not os.path.exists(wav_path):
             print(f"[WARN] WAV not found for {subtitle_name} -> {wav_name}, skip.")
@@ -293,7 +449,10 @@ def run_ass_slice(
             print(f"[WARN] Unsupported subtitle format: {subtitle_name}")
             continue
 
-        print(f"[INFO] Processing {subtitle_name} ({subtitle_format}) with {wav_name}")
+        print(
+            f"[INFO] Processing {subtitle_name} ({subtitle_format}) with {wav_name} "
+            f"[source={source}]"
+        )
         if not raw_dialogues:
             print(f"[WARN] No dialogues in {subtitle_name}")
             continue
@@ -344,7 +503,8 @@ def run_ass_slice(
         total_slices += episode_slice_count
         print(
             f"[INFO] Done {subtitle_name}: slices={episode_slice_count}, "
-            f"filter_mode={filter_mode}, duration_filtered={len(slice_candidates)}"
+            f"filter_mode={filter_mode}, duration_filtered={len(slice_candidates)}, "
+            f"source={source}"
         )
 
     print(
