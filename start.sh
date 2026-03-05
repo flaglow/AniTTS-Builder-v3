@@ -62,13 +62,19 @@ fi
 run_container() {
   local use_gpu_flag="$1"
   local -a gpu_args=()
+  local -a env_args=()
   if [[ "${use_gpu_flag}" == "1" ]]; then
     gpu_args+=(--gpus all)
+  fi
+  if [[ -n "${ANITTS_WAV_CONVERT_WORKERS:-}" ]]; then
+    env_args+=(-e "ANITTS_WAV_CONVERT_WORKERS=${ANITTS_WAV_CONVERT_WORKERS}")
+    echo "[INFO] Passing ANITTS_WAV_CONVERT_WORKERS=${ANITTS_WAV_CONVERT_WORKERS}"
   fi
 
   echo "[INFO] Starting AniTTS (GPU=${use_gpu_flag}) at http://localhost:${APP_PORT}"
   docker run -it --rm \
     -p "${APP_PORT}:7860" \
+    "${env_args[@]}" \
     "${gpu_args[@]}" \
     --name "${CONTAINER_NAME}" \
     -v "${SCRIPT_DIR}:/workspace/AniTTS-Builder-v3" \

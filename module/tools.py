@@ -1,8 +1,79 @@
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import ffmpeg
 import requests
-from tqdm import tqdm
 import shutil
+from tqdm import tqdm
+
+SUPPORTED_MEDIA_EXTENSIONS = (
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".flv",
+    ".webm",
+    ".mp3",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".m4a",
+    ".wav",
+)
+
+
+def _safe_positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
+def _auto_wav_convert_workers():
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(4, cpu_count // 2))
+
+
+def _resolve_wav_convert_workers(workers):
+    if workers is not None:
+        parsed_workers = _safe_positive_int(workers)
+        if parsed_workers is not None:
+            return parsed_workers, "argument"
+        print(f"[WARN] Invalid workers argument '{workers}'. Falling back to env/auto.")
+
+    env_workers = os.getenv("ANITTS_WAV_CONVERT_WORKERS")
+    if env_workers is not None:
+        parsed_env = _safe_positive_int(env_workers)
+        if parsed_env is not None:
+            return parsed_env, "env"
+        print(f"[WARN] Invalid ANITTS_WAV_CONVERT_WORKERS='{env_workers}'. Falling back to auto.")
+
+    return _auto_wav_convert_workers(), "auto"
+
+
+def _build_wav_conversion_jobs(input_folder, output_folder):
+    jobs = []
+    skipped_collisions = []
+    seen_outputs = {}
+
+    for file_name in sorted(os.listdir(input_folder)):
+        input_path = os.path.join(input_folder, file_name)
+        if not os.path.isfile(input_path):
+            continue
+        if not file_name.lower().endswith(SUPPORTED_MEDIA_EXTENSIONS):
+            continue
+
+        output_path = os.path.join(output_folder, os.path.splitext(file_name)[0] + ".wav")
+        previous_input = seen_outputs.get(output_path)
+        if previous_input is not None:
+            skipped_collisions.append((input_path, previous_input, output_path))
+            continue
+
+        seen_outputs[output_path] = input_path
+        jobs.append((input_path, output_path))
+
+    return jobs, skipped_collisions
 
 def convert_to_wav(input_file, output_wav):
     """
@@ -15,7 +86,7 @@ def convert_to_wav(input_file, output_wav):
     try:
         ext = os.path.splitext(input_file)[1].lower()
         
-        if ext in [".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".mp3", ".aac", ".flac", ".ogg", ".m4a", ".wav"]:
+        if ext in SUPPORTED_MEDIA_EXTENSIONS:
             print(f"[INFO] Converting: {input_file} -> {output_wav}")
             (
                 ffmpeg
@@ -24,33 +95,99 @@ def convert_to_wav(input_file, output_wav):
                 .run(overwrite_output=True)
             )
             print(f"[INFO] Conversion completed: {output_wav}")
+            return True
         else:
             print(f"[WARN] Unsupported file format: {ext}")
+            return False
     except ffmpeg.Error as e:
-        print(f"[ERROR] FFmpeg conversion error: {e.stderr.decode()}")
+        error_message = e.stderr.decode() if e.stderr else "Unknown error"
+        print(f"[ERROR] FFmpeg conversion error: {error_message}")
+        return False
+    except Exception as e:
+        print(f"[ERROR] Unexpected conversion error for '{input_file}': {e}")
+        return False
 
-def batch_convert_to_wav(input_folder, output_folder):
+def batch_convert_to_wav(input_folder, output_folder, workers=None):
     """
     Convert all audio and video files in a folder to WAV format.
     
     Args:
         input_folder (str): Path to the folder containing input files.
         output_folder (str): Path to save the converted WAV files.
+        workers (int | None): Number of parallel conversion workers.
     """
     print(f"[INFO] Starting batch conversion to WAV.")
     print(f"[INFO] Input folder: {input_folder}")
     print(f"[INFO] Output folder: {output_folder}")
+
+    if not os.path.isdir(input_folder):
+        print(f"[ERROR] Input folder does not exist: {input_folder}")
+        return
+
     os.makedirs(output_folder, exist_ok=True)
-    supported_extensions = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".mp3", ".aac", ".flac", ".ogg", ".m4a", ".wav")
-    
+
+    jobs, skipped_collisions = _build_wav_conversion_jobs(input_folder, output_folder)
+    for current_input, previous_input, output_path in skipped_collisions:
+        print(
+            f"[WARN] Skipping '{current_input}' because output collision exists with "
+            f"'{previous_input}' -> {output_path}"
+        )
+
+    if not jobs:
+        print(
+            "[INFO] Batch conversion to WAV completed. "
+            f"total=0 converted=0 failed=0 skipped={len(skipped_collisions)} workers=1(source=auto)"
+        )
+        return
+
+    resolved_workers, worker_source = _resolve_wav_convert_workers(workers)
+    effective_workers = min(resolved_workers, len(jobs))
+    print(
+        f"[INFO] WAV conversion worker policy: requested={resolved_workers} "
+        f"effective={effective_workers} source={worker_source}"
+    )
+
     files_converted = 0
-    for file_name in os.listdir(input_folder):
-        input_path = os.path.join(input_folder, file_name)
-        if os.path.isfile(input_path) and file_name.lower().endswith(supported_extensions):
-            output_path = os.path.join(output_folder, os.path.splitext(file_name)[0] + ".wav")
-            convert_to_wav(input_path, output_path)
-            files_converted += 1
-    print(f"[INFO] Batch conversion to WAV completed. Total files converted: {files_converted}")
+    files_failed = 0
+    failed_inputs = []
+
+    if effective_workers <= 1:
+        for input_path, output_path in jobs:
+            if convert_to_wav(input_path, output_path):
+                files_converted += 1
+            else:
+                files_failed += 1
+                failed_inputs.append(input_path)
+    else:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {
+                executor.submit(convert_to_wav, input_path, output_path): input_path
+                for input_path, output_path in jobs
+            }
+            for future in as_completed(futures):
+                input_path = futures[future]
+                try:
+                    success = bool(future.result())
+                except Exception as e:
+                    print(f"[ERROR] Worker crashed while converting '{input_path}': {e}")
+                    success = False
+
+                if success:
+                    files_converted += 1
+                else:
+                    files_failed += 1
+                    failed_inputs.append(input_path)
+
+    print(
+        "[INFO] Batch conversion to WAV completed. "
+        f"total={len(jobs)} converted={files_converted} "
+        f"failed={files_failed} skipped={len(skipped_collisions)} "
+        f"workers={effective_workers}(source={worker_source})"
+    )
+    if failed_inputs:
+        print("[WARN] Failed input files:")
+        for failed_path in failed_inputs:
+            print(f"[WARN] - {failed_path}")
 
 def convert_wav_to_mp3(input_wav, output_mp3):
     """

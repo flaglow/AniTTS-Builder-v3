@@ -60,6 +60,27 @@ This program is developed to run through dockers. Please install CUDA 12.1 + CUD
 
 3. From the first tab to the third tab, press the buttons in order from top to bottom. You can see the progress screen in the CMD window. While one task is running, the other button is disabled.
 
+## WAV Conversion Parallelism
+
+- The `Convert to WAV` step now runs in parallel by default.
+- Default worker policy: `max(1, min(4, floor(CPU cores / 2)))`
+- You can override it with `ANITTS_WAV_CONVERT_WORKERS`:
+  - `ANITTS_WAV_CONVERT_WORKERS=1` forces single-file conversion.
+  - Values greater than 1 enable multi-file conversion.
+
+Examples:
+
+```bash
+# Linux / WSL
+ANITTS_WAV_CONVERT_WORKERS=4 ./start.sh myproject
+```
+
+```bat
+REM Windows CMD
+set ANITTS_WAV_CONVERT_WORKERS=4
+start.bat
+```
+
 ## Precautions
 
 - The developer's GPU is an RTX 4070ti SUPER, and it took about 6 hours to process approximately 240 minutes (1 season) of animation. Be cautious to prevent the program from terminating during the process, and it is recommended to ensure more than 10GB of free storage space before running the program.
