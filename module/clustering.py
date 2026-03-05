@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 
+from module.memory_cleanup import release_torch_resources
+
 
 def _safe_int(value, default):
     try:
@@ -179,6 +181,7 @@ def compute_embeddings(
             continue
         valid_wav_files.append(path)
         audio_arrays.append(audio)
+    prepared.clear()
 
     prepare_s = time.perf_counter() - prepare_start
     if not audio_arrays:
@@ -186,44 +189,56 @@ def compute_embeddings(
         return None, [], [], {"prepare_audio_s": prepare_s, "total_s": time.perf_counter() - total_start}
 
     print("[INFO] Loading ReDimNet model from GitHub repository.")
-    model = torch.hub.load(
-        "IDRnD/ReDimNet",
-        "ReDimNet",
-        model_name="b6",
-        train_type="ft_lm",
-        dataset="vox2",
-        source="github",
-        force_reload=False,
-        skip_validation=True,
-    )
-    model.to(device)
-    model.eval()
-    if use_half:
-        model.half()
-    print("[INFO] ReDimNet model loaded successfully.")
-
+    model = None
     embed_start = time.perf_counter()
     embedding_chunks = []
+    batch = None
+    emb = None
+    try:
+        model = torch.hub.load(
+            "IDRnD/ReDimNet",
+            "ReDimNet",
+            model_name="b6",
+            train_type="ft_lm",
+            dataset="vox2",
+            source="github",
+            force_reload=False,
+            skip_validation=True,
+        )
+        model.to(device)
+        model.eval()
+        if use_half:
+            model.half()
+        print("[INFO] ReDimNet model loaded successfully.")
 
-    with torch.no_grad():
-        for i in range(0, len(audio_arrays), embedding_batch_size):
-            batch_audio = audio_arrays[i : i + embedding_batch_size]
-            max_len = max(x.shape[0] for x in batch_audio)
-            batch = torch.zeros((len(batch_audio), max_len), dtype=torch.float32)
-            for row_idx, arr in enumerate(batch_audio):
-                n = arr.shape[0]
-                batch[row_idx, :n] = torch.from_numpy(arr)
+        with torch.no_grad():
+            for i in range(0, len(audio_arrays), embedding_batch_size):
+                batch_audio = audio_arrays[i : i + embedding_batch_size]
+                max_len = max(x.shape[0] for x in batch_audio)
+                batch = torch.zeros((len(batch_audio), max_len), dtype=torch.float32)
+                for row_idx, arr in enumerate(batch_audio):
+                    n = arr.shape[0]
+                    batch[row_idx, :n] = torch.from_numpy(arr)
 
-            batch = batch.to(device)
-            if use_half:
-                batch = batch.half()
+                batch = batch.to(device)
+                if use_half:
+                    batch = batch.half()
 
-            emb = model(batch)
-            if emb.dim() == 1:
-                emb = emb.unsqueeze(0)
-            embedding_chunks.append(emb.float().cpu())
+                emb = model(batch)
+                if emb.dim() == 1:
+                    emb = emb.unsqueeze(0)
+                embedding_chunks.append(emb.float().cpu())
+                batch = None
+                emb = None
+    finally:
+        batch = None
+        emb = None
+        release_torch_resources("clustering_embeddings", [model])
+        model = None
 
+    audio_arrays.clear()
     embeddings = torch.cat(embedding_chunks, dim=0)
+    embedding_chunks.clear()
     embeddings = _normalize_embeddings(embeddings)
     embed_s = time.perf_counter() - embed_start
 
@@ -364,6 +379,8 @@ def _try_torch_kmeans(x_cpu, k, max_iters=100):
     if not torch.cuda.is_available():
         return None, None
 
+    x_gpu = None
+    model = None
     try:
         from torch_kmeans import KMeans
 
@@ -392,6 +409,10 @@ def _try_torch_kmeans(x_cpu, k, max_iters=100):
     except Exception as exc:
         print(f"[WARN] torch_kmeans unavailable, fallback to CPU vectorized K-Means. error={exc}")
         return None, None
+    finally:
+        x_gpu = None
+        model = None
+        release_torch_resources("clustering_kmeans", [])
 
 
 def hdbscan_kmeans_clustering(
@@ -665,41 +686,50 @@ def clustering_for_main(
     Main function to run clustering process.
     """
     print(f"[INFO] Starting clustering process for WAV folder: {wav_folder}.")
+    embeddings = None
+    valid_wav_files = []
+    noise_files = []
+    embed_timing = {}
+    try:
+        embeddings, valid_wav_files, noise_files, embed_timing = compute_embeddings(
+            directory=wav_folder,
+            max_audio_length=10.0,
+            min_duration=0.5,
+            max_duration=10.0,
+            cache_dir=cache_dir,
+            target_sr=16000,
+            use_half=False,
+            audio_workers=audio_workers,
+            embedding_batch_size=embedding_batch_size,
+            prefer_process_pool=True,
+        )
 
-    embeddings, valid_wav_files, noise_files, embed_timing = compute_embeddings(
-        directory=wav_folder,
-        max_audio_length=10.0,
-        min_duration=0.5,
-        max_duration=10.0,
-        cache_dir=cache_dir,
-        target_sr=16000,
-        use_half=False,
-        audio_workers=audio_workers,
-        embedding_batch_size=embedding_batch_size,
-        prefer_process_pool=True,
-    )
+        if embeddings is None or len(valid_wav_files) == 0:
+            print("[WARN] No valid audio files found for clustering.")
+            return
 
-    if embeddings is None or len(valid_wav_files) == 0:
-        print("[WARN] No valid audio files found for clustering.")
-        return
+        print("[INFO] Performing HDBSCAN + K-Means clustering.")
+        hdbscan_kmeans_clustering(
+            embeddings=embeddings,
+            valid_wav_files=valid_wav_files,
+            noise_files=noise_files,
+            destination_folder=output_folder,
+            hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+            hdbscan_min_samples=hdbscan_min_samples,
+            cluster_selection_epsilon=cluster_selection_epsilon,
+            max_distance=max_distance,
+            kmeans_max_iters=kmeans_max_iters,
+            prefer_gpu_hdbscan=prefer_gpu_hdbscan,
+            prefer_gpu_kmeans=prefer_gpu_kmeans,
+            cpu_math_threads=cpu_math_threads,
+            copy_workers=copy_workers,
+        )
 
-    print("[INFO] Performing HDBSCAN + K-Means clustering.")
-    hdbscan_kmeans_clustering(
-        embeddings=embeddings,
-        valid_wav_files=valid_wav_files,
-        noise_files=noise_files,
-        destination_folder=output_folder,
-        hdbscan_min_cluster_size=hdbscan_min_cluster_size,
-        hdbscan_min_samples=hdbscan_min_samples,
-        cluster_selection_epsilon=cluster_selection_epsilon,
-        max_distance=max_distance,
-        kmeans_max_iters=kmeans_max_iters,
-        prefer_gpu_hdbscan=prefer_gpu_hdbscan,
-        prefer_gpu_kmeans=prefer_gpu_kmeans,
-        cpu_math_threads=cpu_math_threads,
-        copy_workers=copy_workers,
-    )
-
-    print("[INFO] Removing small clusters (folders with insufficient files).")
-    remove_small_clusters(destination_folder=output_folder, min_files=10)
-    print(f"[INFO] Clustering process completed. embedding_timing={embed_timing}")
+        print("[INFO] Removing small clusters (folders with insufficient files).")
+        remove_small_clusters(destination_folder=output_folder, min_files=10)
+        print(f"[INFO] Clustering process completed. embedding_timing={embed_timing}")
+    finally:
+        embeddings = None
+        valid_wav_files = []
+        noise_files = []
+        release_torch_resources("clustering", [])

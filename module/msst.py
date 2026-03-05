@@ -3,6 +3,7 @@ import sys
 
 sys.path.append(f"{os.path.dirname(__file__)}/model/MSST_WebUI")
 
+from module.memory_cleanup import release_torch_resources
 from module.model.MSST_WebUI.inference.msst_infer import MSSeparator
 from module.model.MSST_WebUI.utils.logger import get_logger
 
@@ -36,12 +37,15 @@ def process_msst(model, model_type, folder_path, stem):
     Process audio files using the MSSeparator model.
     """
     print(f"[INFO] Starting processing with stem '{stem}' in folder '{folder_path}'.")
-    separator = load_separator(model, model_type, folder_path)
-    print("[INFO] Processing folder using MSSeparator.")
-    inputs_list = separator.process_folder(folder_path)
-    print(f"[INFO] Processing complete. {len(inputs_list)} files processed.")
-    separator.del_cache()
-    print("[INFO] Cache cleared after processing.")
+    separator = None
+    inputs_list = []
+    try:
+        separator = load_separator(model, model_type, folder_path)
+        print("[INFO] Processing folder using MSSeparator.")
+        inputs_list = separator.process_folder(folder_path)
+        print(f"[INFO] Processing complete. {len(inputs_list)} files processed.")
+    finally:
+        release_torch_resources("msst", [separator])
 
     results_list = [[f"{folder_path}/{i[:-4]}_{stem}.wav", f"{folder_path}/{i}"] for i in inputs_list]
     for old, new in results_list:

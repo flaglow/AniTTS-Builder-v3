@@ -5,6 +5,8 @@ from transformers import pipeline, WhisperProcessor, WhisperForConditionalGenera
 import numpy as np
 from glob import glob
 
+from module.memory_cleanup import release_torch_resources
+
 def load_model(model_id, cache_dir):
     """
     Load the Whisper ASR model with given model ID and cache directory.
@@ -80,56 +82,69 @@ def audio_normalize(audio):
     print("[INFO] Audio normalization complete.")
     return waveform, sample_rate
 
-def extract_timestamps(timestamps, waveform, cache_dir, samplerate=16000, model_id="waveletdeboshir/whisper-large-v3-no-numbers"):
+def extract_timestamps(
+    timestamps,
+    waveform,
+    cache_dir,
+    samplerate=16000,
+    model_id="waveletdeboshir/whisper-large-v3-no-numbers",
+    pipe=None,
+):
     """
     Extract precise timestamps from non-silent audio segments.
     If a segment requires more than 10 chunks to process, skip that segment.
     """
     print("[INFO] Extracting precise timestamps from non-silent segments.")
-    pipe = load_model(model_id, cache_dir)
+    owns_pipe = pipe is None
+    if owns_pipe:
+        pipe = load_model(model_id, cache_dir)
     refined_timestamps = []
 
-    for segment_index, (start, end) in enumerate(timestamps):
-        print(f"[INFO] Processing segment {segment_index+1}: from {start:.2f} to {end:.2f} seconds.")
-        segment = waveform[int(start * samplerate):int(end * samplerate)]
-        savetime, temp_timestamps = 0, []
-        chunk_count = 0
+    try:
+        for segment_index, (start, end) in enumerate(timestamps):
+            print(f"[INFO] Processing segment {segment_index+1}: from {start:.2f} to {end:.2f} seconds.")
+            segment = waveform[int(start * samplerate):int(end * samplerate)]
+            savetime, temp_timestamps = 0, []
+            chunk_count = 0
 
-        while len(segment) / samplerate >= 30 or savetime == 0:
-            chunk_count += 1
-            if chunk_count > 30:
-                print(f"[WARN] Segment {segment_index+1} exceeded 30 chunks; skipping this segment.")
-                temp_timestamps = []  # Discard partial results
-                break
-            print(f"[INFO] Processing chunk {chunk_count} of segment {segment_index+1}.")
-            chunk = segment[:30 * samplerate]
-            result = pipe(chunk, generate_kwargs={
-                "num_beams": 1,
-                "temperature": 0.0,
-                "return_timestamps": True,
-                "task": "transcribe"
-            })
-            if not result['chunks']:
-                print("[WARN] No transcription chunks found in current chunk.")
-                break
+            while len(segment) / samplerate >= 30 or savetime == 0:
+                chunk_count += 1
+                if chunk_count > 30:
+                    print(f"[WARN] Segment {segment_index+1} exceeded 30 chunks; skipping this segment.")
+                    temp_timestamps = []  # Discard partial results
+                    break
+                print(f"[INFO] Processing chunk {chunk_count} of segment {segment_index+1}.")
+                chunk = segment[:30 * samplerate]
+                result = pipe(chunk, generate_kwargs={
+                    "num_beams": 1,
+                    "temperature": 0.0,
+                    "return_timestamps": True,
+                    "task": "transcribe"
+                })
+                if not result['chunks']:
+                    print("[WARN] No transcription chunks found in current chunk.")
+                    break
 
-            for i in result['chunks']:
-                if i['timestamp'] and i['timestamp'][0] is not None and i['timestamp'][1] is not None and i['timestamp'][0] < i['timestamp'][1] < 30:
-                    temp_timestamps.append((i['timestamp'][0] + savetime, i['timestamp'][1] + savetime))
-                    savetime = i['timestamp'][1]
+                for i in result['chunks']:
+                    if i['timestamp'] and i['timestamp'][0] is not None and i['timestamp'][1] is not None and i['timestamp'][0] < i['timestamp'][1] < 30:
+                        temp_timestamps.append((i['timestamp'][0] + savetime, i['timestamp'][1] + savetime))
+                        savetime = i['timestamp'][1]
 
-            segment = segment[int(savetime * samplerate):]
+                segment = segment[int(savetime * samplerate):]
 
-        if chunk_count > 10:
-            # Skip adding timestamps for this segment if chunk limit exceeded
-            print(f"[INFO] Skipping segment {segment_index+1} due to excessive chunk count.")
-            continue
+            if chunk_count > 10:
+                # Skip adding timestamps for this segment if chunk limit exceeded
+                print(f"[INFO] Skipping segment {segment_index+1} due to excessive chunk count.")
+                continue
 
-        print(f"[INFO] Extracted {len(temp_timestamps)} timestamps from segment {segment_index+1}.")
-        refined_timestamps += [(start + ts[0], start + ts[1]) for ts in temp_timestamps]
+            print(f"[INFO] Extracted {len(temp_timestamps)} timestamps from segment {segment_index+1}.")
+            refined_timestamps += [(start + ts[0], start + ts[1]) for ts in temp_timestamps]
 
-    print("[INFO] Timestamp extraction complete.")
-    return refined_timestamps
+        print("[INFO] Timestamp extraction complete.")
+        return refined_timestamps
+    finally:
+        if owns_pipe:
+            release_torch_resources("whisper", [pipe])
 
 def save_slices(info, wav_output_dir):
     """
@@ -167,20 +182,30 @@ def process_audio_files(input_folder, output_dir, cache_dir, model_id):
     file_list = glob(os.path.join(input_folder, "*.mp3"))
     print(f"[INFO] Found {len(file_list)} audio files.")
 
-    for wav_file in file_list:
-        print(f"[INFO] Processing file: {wav_file}.")
-        audio = torchaudio.load(wav_file)
-        normalized_audio, _ = audio_normalize(audio)
+    if not file_list:
+        print("[INFO] No MP3 files to process.")
+        return
 
-        timestamps = detect_non_silent(normalized_audio)
-        print(f"[INFO] Detected {len(timestamps)} non-silent segments in file: {wav_file}.")
+    pipe = None
+    try:
+        pipe = load_model(model_id, cache_dir)
 
-        timestamps = extract_timestamps(timestamps, normalized_audio, cache_dir, model_id=model_id)
-        print(f"[INFO] Refined to {len(timestamps)} timestamps after extraction for file: {wav_file}.")
+        for wav_file in file_list:
+            print(f"[INFO] Processing file: {wav_file}.")
+            audio = torchaudio.load(wav_file)
+            normalized_audio, _ = audio_normalize(audio)
 
-        info.append((wav_file, timestamps))
-        print(f"[INFO] Finished processing file: {wav_file}.")
+            timestamps = detect_non_silent(normalized_audio)
+            print(f"[INFO] Detected {len(timestamps)} non-silent segments in file: {wav_file}.")
 
-    print("[INFO] Saving slices for all processed files.")
-    save_slices(info, output_dir)
-    print("[INFO] Audio processing completed.")
+            timestamps = extract_timestamps(timestamps, normalized_audio, cache_dir, model_id=model_id, pipe=pipe)
+            print(f"[INFO] Refined to {len(timestamps)} timestamps after extraction for file: {wav_file}.")
+
+            info.append((wav_file, timestamps))
+            print(f"[INFO] Finished processing file: {wav_file}.")
+
+        print("[INFO] Saving slices for all processed files.")
+        save_slices(info, output_dir)
+        print("[INFO] Audio processing completed.")
+    finally:
+        release_torch_resources("whisper", [pipe])
