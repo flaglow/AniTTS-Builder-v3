@@ -37,15 +37,20 @@ This program is developed to run through dockers. Please install CUDA 12.1 + CUD
    chmod +x setup.sh start.sh
    ./setup.sh
    ```
+   - Optional:
+     - `INSTALL_CUML=1 ./setup.sh` (enable cuML install)
+     - `NO_CACHE=1 ./setup.sh` (build without Docker cache)
 5. Start the container and create a data folder (e.g. `data_myproject`):
    ```bash
-   ./start.sh
+   ./start.sh myproject
    ```
-   - When prompted, enter a folder suffix using only English letters and numbers (e.g. `myproject`).
-6. After the Docker container starts and you see a shell prompt inside the container, run:
-   ```bash
-   python main.py
-   ```
+   - If you omit the argument, it prompts for suffix input.
+   - The script launches Gradio directly at `http://localhost:7860`.
+   - Optional:
+     - `USE_GPU=0 ./start.sh myproject` (CPU mode)
+     - `APP_PORT=7861 ./start.sh myproject` (change host port)
+     - `IMAGE_NAME=my-image ./start.sh myproject` (custom image name)
+6. Open `http://localhost:7860` (or your `APP_PORT`) and run the pipeline from the UI.
    
 ## Usage
 

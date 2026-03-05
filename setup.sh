@@ -1,17 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 현재 스크립트가 있는 디렉터리로 이동
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Optional: INSTALL_CUML=1 ./setup.sh
-INSTALL_CUML="${INSTALL_CUML:-0}"
+IMAGE_NAME="${IMAGE_NAME:-anitts-builder-v3}"
+INSTALL_CUML="${INSTALL_CUML:-0}"  # Optional: INSTALL_CUML=1 ./setup.sh
+NO_CACHE="${NO_CACHE:-0}"          # Optional: NO_CACHE=1 ./setup.sh
 
-# Docker 이미지 빌드 (기본: 캐시 사용)
-docker build \
+if ! command -v docker >/dev/null 2>&1; then
+  echo "[ERROR] docker command not found. Please install Docker first."
+  exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "[ERROR] Docker daemon is not available. Please start Docker and retry."
+  exit 1
+fi
+
+BUILD_ARGS=()
+if [[ "$NO_CACHE" == "1" ]]; then
+  BUILD_ARGS+=(--no-cache)
+fi
+
+echo "[INFO] Building Docker image: ${IMAGE_NAME}"
+echo "[INFO] Build options: INSTALL_CUML=${INSTALL_CUML}, NO_CACHE=${NO_CACHE}"
+
+docker build "${BUILD_ARGS[@]}" \
   --build-arg INSTALL_CUML="${INSTALL_CUML}" \
-  -t anitts-builder-v3 .
+  -t "${IMAGE_NAME}" .
 
-# 일시 정지 (Windows의 pause 대체)
-read -rp "Press Enter to continue..." _
+echo "[INFO] Build completed: ${IMAGE_NAME}"

@@ -20,6 +20,7 @@ with gr.Blocks() as demo:
     wav_folder = gr.Textbox(value="./data/audio_wav", interactive=False, visible=False)
     mp3_folder = gr.Textbox(value="./data/audio_mp3", interactive=False, visible=False)
     text_folder = gr.Textbox(value="./data/transcribe", interactive=False, visible=False)
+    sync_profile_path = gr.Textbox(value="./data/transcribe/sync_profile.json", interactive=False, visible=False)
     result_folder = gr.Textbox(value="./data/result", interactive=False, visible=False)
     whisper_cache_dir = gr.Textbox(value="./module/model/whisper", interactive=False, visible=False)
     embeddings_cache_dir = gr.Textbox(value="./module/model/redimmet", interactive=False, visible=False)
@@ -69,7 +70,7 @@ with gr.Blocks() as demo:
                 "`./data/transcribe` 폴더에 넣어 주세요.\n"
                 "   - 예) `[Moozzi2] Steins;Gate - 01 ....mkv` ↔ 같은 이름의 `.ass`\n"
                 "2. 아래 버튼을 **1 → 5 순서**로 한 번씩 눌러 주세요.\n"
-                "3. Whisper 대신 자막의 타임스탬프와 텍스트를 그대로 사용합니다."
+                "3. Whisper 대신 자막 타임스탬프를 사용하되, 필요 시 자동 싱크 보정(오프셋/드리프트)을 적용합니다."
             )
             btn_ws_convert_wav = gr.Button("1. 동영상을 WAV로 변환 (Convert to WAV)")
             btn_ws_download_model = gr.Button("2. 분리 모델 다운로드 (Download Separation Models)")
@@ -78,8 +79,16 @@ with gr.Blocks() as demo:
             gr.Markdown(
                 "#### ASS 자막으로 음성 조각 만들기\n"
                 "4. ASS 자막의 타임스탬프를 사용해 WAV를 잘게 자르고, "
-                "`./data/transcribe`에 `[화자] 대사` 텍스트를 저장합니다."
+                "`./data/transcribe`에 `[화자] 대사` 텍스트를 저장합니다.\n"
+                "- 자동 보정 실패 시 해당 에피소드는 스킵되고 `./logs/ass_sync` 및 "
+                "`sync_profile.json`에 `needs_manual`로 기록됩니다."
             )
+            ws_auto_sync = gr.Checkbox(label="4-A. 자동 싱크 보정 사용", value=True)
+            ws_manual_offset = gr.Number(label="4-B. 수동 오프셋 (ms)", value=0.0, precision=2)
+            ws_manual_drift = gr.Number(label="4-C. 수동 드리프트 (ppm)", value=0.0, precision=2)
+            ws_auto_filter = gr.Checkbox(label="4-D. 비대사 자막 자동 필터링", value=True)
+            ws_use_profile = gr.Checkbox(label="4-E. sync_profile.json 사용", value=True)
+            ws_dry_run = gr.Checkbox(label="4-F. Dry-run (파일 생성 없이 리포트만)", value=False)
             btn_ws_ass_slice = gr.Button("4. ASS 자막 기준으로 음성 조각 생성 (Slice by ASS Subtitles)")
 
             gr.Markdown(
@@ -150,7 +159,19 @@ with gr.Blocks() as demo:
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ws_ass_slice.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(run_ass_slice, inputs=[], outputs=[]) \
+        .then(
+            run_ass_slice,
+            inputs=[
+                ws_auto_sync,
+                ws_manual_offset,
+                ws_manual_drift,
+                ws_use_profile,
+                sync_profile_path,
+                ws_dry_run,
+                ws_auto_filter,
+            ],
+            outputs=[],
+        ) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ws_clustering.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
