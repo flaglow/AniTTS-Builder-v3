@@ -1,14 +1,257 @@
-from module.tools import batch_convert_to_wav, download_pretrained_models, batch_convert_wav_to_mp3
+from module.tools import (
+    SUPPORTED_MEDIA_EXTENSIONS,
+    PRETRAINED_MODEL_URLS,
+    batch_convert_to_wav,
+    download_pretrained_models,
+    batch_convert_wav_to_mp3,
+)
 from module.whisper import process_audio_files
 from module.msst import msst_for_main
 from module.clustering import clustering_for_main
 from module.ass_slice import run_ass_slice
 import os
+import time
 import gradio as gr
 import warnings
+from datetime import datetime
 warnings.filterwarnings("ignore")
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _count_files_with_ext(folder, exts):
+    if not os.path.isdir(folder):
+        return 0
+    ext_set = {e.lower() for e in exts}
+    count = 0
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and os.path.splitext(name)[1].lower() in ext_set:
+            count += 1
+    return count
+
+
+def _count_wavs_recursive(folder):
+    if not os.path.isdir(folder):
+        return 0
+    total = 0
+    for root, _, files in os.walk(folder):
+        total += sum(1 for f in files if f.lower().endswith(".wav"))
+    return total
+
+
+def _count_target_model_files():
+    root = "./module/model/MSST_WebUI/pretrain"
+    total = 0
+    for rel_path in PRETRAINED_MODEL_URLS.keys():
+        if os.path.exists(os.path.join(root, rel_path)):
+            total += 1
+    return total
+
+
+def _stage_log_start(stage_name, input_files=None, extra=None):
+    message = f"[INFO] [STAGE] {stage_name} start_time={_now_str()}"
+    if input_files is not None:
+        message += f" input_files={input_files}"
+    if extra:
+        message += f" {extra}"
+    print(message)
+
+
+def _stage_log_done(stage_name, started_at_perf, input_files=None, output_files=None, extra=None):
+    elapsed_s = time.perf_counter() - started_at_perf
+    avg_s = (elapsed_s / input_files) if input_files and input_files > 0 else 0.0
+    message = (
+        f"[INFO] [STAGE] {stage_name} done_time={_now_str()} "
+        f"elapsed_s={elapsed_s:.3f} avg_s_per_file={avg_s:.3f}"
+    )
+    if input_files is not None:
+        message += f" input_files={input_files}"
+    if output_files is not None:
+        message += f" output_files={output_files}"
+    if extra:
+        message += f" {extra}"
+    print(message)
+
+
+def _stage_log_fail(stage_name, started_at_perf, input_files=None, output_files=None, error=None):
+    elapsed_s = time.perf_counter() - started_at_perf
+    message = (
+        f"[ERROR] [STAGE] {stage_name} failed_time={_now_str()} "
+        f"elapsed_s={elapsed_s:.3f}"
+    )
+    if input_files is not None:
+        message += f" input_files={input_files}"
+    if output_files is not None:
+        message += f" output_files={output_files}"
+    if error:
+        message += f" error={error}"
+    print(message)
+
+
+def stage_convert_to_wav(video_folder, wav_folder, pipeline_name):
+    input_count = _count_files_with_ext(video_folder, SUPPORTED_MEDIA_EXTENSIONS)
+    before_output = _count_files_with_ext(wav_folder, (".wav",))
+    stage_name = f"{pipeline_name}#1 Convert to WAV"
+    started_at = time.perf_counter()
+    _stage_log_start(stage_name, input_files=input_count, extra=f"output_wavs_before={before_output}")
+    try:
+        batch_convert_to_wav(video_folder, wav_folder)
+        after_output = _count_files_with_ext(wav_folder, (".wav",))
+        _stage_log_done(
+            stage_name,
+            started_at,
+            input_files=input_count,
+            output_files=after_output,
+            extra=f"new_output_files={max(0, after_output - before_output)}",
+        )
+    except Exception as exc:
+        _stage_log_fail(stage_name, started_at, input_files=input_count, output_files=before_output, error=exc)
+        raise
+
+
+def stage_download_models(pipeline_name):
+    stage_label = "Download Transcribe Models" if pipeline_name == "NoSub" else "Download Separation Models"
+    stage_name = f"{pipeline_name}#2 {stage_label}"
+    target_count = len(PRETRAINED_MODEL_URLS)
+    before_count = _count_target_model_files()
+    started_at = time.perf_counter()
+    _stage_log_start(
+        stage_name,
+        input_files=target_count,
+        extra=f"models_present_before={before_count} missing_before={max(0, target_count - before_count)}",
+    )
+    try:
+        download_pretrained_models()
+        after_count = _count_target_model_files()
+        _stage_log_done(
+            stage_name,
+            started_at,
+            input_files=target_count,
+            output_files=after_count,
+            extra=f"downloaded_now={max(0, after_count - before_count)} missing_after={max(0, target_count - after_count)}",
+        )
+    except Exception as exc:
+        _stage_log_fail(stage_name, started_at, input_files=target_count, output_files=before_count, error=exc)
+        raise
+
+
+def stage_remove_wav_bgm(wav_folder, pipeline_name):
+    stage_name = f"{pipeline_name}#3 Remove WAV BGM"
+    input_count = _count_files_with_ext(wav_folder, (".wav",))
+    started_at = time.perf_counter()
+    _stage_log_start(stage_name, input_files=input_count)
+    try:
+        msst_for_main(wav_folder)
+        output_count = _count_files_with_ext(wav_folder, (".wav",))
+        _stage_log_done(stage_name, started_at, input_files=input_count, output_files=output_count)
+    except Exception as exc:
+        _stage_log_fail(stage_name, started_at, input_files=input_count, error=exc)
+        raise
+
+
+def stage_convert_wav_to_mp3(wav_folder, mp3_folder):
+    stage_name = "NoSub#4 Convert to MP3"
+    input_count = _count_files_with_ext(wav_folder, (".wav",))
+    before_output = _count_files_with_ext(mp3_folder, (".mp3",))
+    started_at = time.perf_counter()
+    _stage_log_start(stage_name, input_files=input_count, extra=f"output_mp3_before={before_output}")
+    try:
+        batch_convert_wav_to_mp3(wav_folder, mp3_folder)
+        after_output = _count_files_with_ext(mp3_folder, (".mp3",))
+        _stage_log_done(
+            stage_name,
+            started_at,
+            input_files=input_count,
+            output_files=after_output,
+            extra=f"new_output_files={max(0, after_output - before_output)}",
+        )
+    except Exception as exc:
+        _stage_log_fail(stage_name, started_at, input_files=input_count, output_files=before_output, error=exc)
+        raise
+
+
+def stage_transcribe(mp3_folder, wav_folder, whisper_cache_dir, model_id):
+    stage_name = "NoSub#5 Generate Timestamps"
+    input_count = _count_files_with_ext(mp3_folder, (".mp3",))
+    wav_before = _count_files_with_ext(wav_folder, (".wav",))
+    started_at = time.perf_counter()
+    _stage_log_start(
+        stage_name,
+        input_files=input_count,
+        extra=f"output_wavs_before={wav_before} model_id={model_id}",
+    )
+    try:
+        process_audio_files(mp3_folder, wav_folder, whisper_cache_dir, model_id)
+        wav_after = _count_files_with_ext(wav_folder, (".wav",))
+        _stage_log_done(
+            stage_name,
+            started_at,
+            input_files=input_count,
+            output_files=wav_after,
+            extra=f"new_output_files={max(0, wav_after - wav_before)}",
+        )
+    except Exception as exc:
+        _stage_log_fail(stage_name, started_at, input_files=input_count, output_files=wav_before, error=exc)
+        raise
+
+
+def stage_slice_by_subtitles(dry_run, auto_filter_non_dialogue):
+    stage_name = "Sub#4 Slice by Subtitles"
+    subtitle_count = _count_files_with_ext("./data/transcribe", (".ass", ".srt", ".smi"))
+    wav_before = _count_files_with_ext("./data/audio_wav", (".wav",))
+    txt_before = _count_files_with_ext("./data/transcribe", (".txt",))
+    started_at = time.perf_counter()
+    _stage_log_start(
+        stage_name,
+        input_files=subtitle_count,
+        extra=(
+            f"dry_run={dry_run} auto_filter_non_dialogue={auto_filter_non_dialogue} "
+            f"output_wavs_before={wav_before} output_txt_before={txt_before}"
+        ),
+    )
+    try:
+        run_ass_slice(dry_run=dry_run, auto_filter_non_dialogue=auto_filter_non_dialogue)
+        wav_after = _count_files_with_ext("./data/audio_wav", (".wav",))
+        txt_after = _count_files_with_ext("./data/transcribe", (".txt",))
+        _stage_log_done(
+            stage_name,
+            started_at,
+            input_files=subtitle_count,
+            output_files=wav_after,
+            extra=(
+                f"new_output_wavs={max(0, wav_after - wav_before)} "
+                f"new_output_txts={max(0, txt_after - txt_before)}"
+            ),
+        )
+    except Exception as exc:
+        _stage_log_fail(stage_name, started_at, input_files=subtitle_count, output_files=wav_before, error=exc)
+        raise
+
+
+def stage_clustering(wav_folder, result_folder, embeddings_cache_dir, pipeline_name, stage_number):
+    stage_name = f"{pipeline_name}#{stage_number} Run Embeddings & Clustering"
+    input_count = _count_files_with_ext(wav_folder, (".wav",))
+    output_before = _count_wavs_recursive(result_folder)
+    started_at = time.perf_counter()
+    _stage_log_start(stage_name, input_files=input_count, extra=f"result_wavs_before={output_before}")
+    try:
+        clustering_for_main(wav_folder, result_folder, embeddings_cache_dir)
+        output_after = _count_wavs_recursive(result_folder)
+        _stage_log_done(
+            stage_name,
+            started_at,
+            input_files=input_count,
+            output_files=output_after,
+            extra=f"new_clustered_wavs={max(0, output_after - output_before)}",
+        )
+    except Exception as exc:
+        _stage_log_fail(stage_name, started_at, input_files=input_count, output_files=output_before, error=exc)
+        raise
 
 with gr.Blocks() as demo:
     gr.Markdown("## AniTTS Builder-v3")
@@ -115,45 +358,49 @@ with gr.Blocks() as demo:
 
     # 1) 자막이 없는 경우 파이프라인
     btn_ns_convert_wav.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(batch_convert_to_wav, inputs=[video_folder, wav_folder], outputs=[]) \
+        .then(lambda v, w: stage_convert_to_wav(v, w, "NoSub"), inputs=[video_folder, wav_folder], outputs=[]) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ns_download_model.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(download_pretrained_models, inputs=[], outputs=[]) \
+        .then(lambda: stage_download_models("NoSub"), outputs=[]) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ns_msst_wav.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(msst_for_main, inputs=[wav_folder], outputs=[]) \
+        .then(lambda w: stage_remove_wav_bgm(w, "NoSub"), inputs=[wav_folder], outputs=[]) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ns_convert_mp3.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(batch_convert_wav_to_mp3, inputs=[wav_folder, mp3_folder], outputs=[]) \
+        .then(stage_convert_wav_to_mp3, inputs=[wav_folder, mp3_folder], outputs=[]) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ns_transcribe.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(process_audio_files, inputs=[mp3_folder, wav_folder, whisper_cache_dir, txt_model_id], outputs=[]) \
+        .then(stage_transcribe, inputs=[mp3_folder, wav_folder, whisper_cache_dir, txt_model_id], outputs=[]) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ns_clustering.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(clustering_for_main, inputs=[wav_folder, result_folder, embeddings_cache_dir], outputs=[]) \
+        .then(
+            lambda w, r, c: stage_clustering(w, r, c, "NoSub", 6),
+            inputs=[wav_folder, result_folder, embeddings_cache_dir],
+            outputs=[],
+        ) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     # 2) 자막이 있는 경우 파이프라인
     btn_ws_convert_wav.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(batch_convert_to_wav, inputs=[video_folder, wav_folder], outputs=[]) \
+        .then(lambda v, w: stage_convert_to_wav(v, w, "Sub"), inputs=[video_folder, wav_folder], outputs=[]) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ws_download_model.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(download_pretrained_models, inputs=[], outputs=[]) \
+        .then(lambda: stage_download_models("Sub"), outputs=[]) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ws_msst_wav.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(msst_for_main, inputs=[wav_folder], outputs=[]) \
+        .then(lambda w: stage_remove_wav_bgm(w, "Sub"), inputs=[wav_folder], outputs=[]) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ws_ass_slice.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
         .then(
-            run_ass_slice,
+            stage_slice_by_subtitles,
             inputs=[
                 ws_dry_run,
                 ws_auto_filter,
@@ -163,7 +410,11 @@ with gr.Blocks() as demo:
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
     btn_ws_clustering.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
-        .then(clustering_for_main, inputs=[wav_folder, result_folder, embeddings_cache_dir], outputs=[]) \
+        .then(
+            lambda w, r, c: stage_clustering(w, r, c, "Sub", 5),
+            inputs=[wav_folder, result_folder, embeddings_cache_dir],
+            outputs=[],
+        ) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
 
 demo.launch(server_name="0.0.0.0", server_port=7860)

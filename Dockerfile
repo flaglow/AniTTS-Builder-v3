@@ -2,7 +2,7 @@ FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-devel
 
 # Set working directory
 WORKDIR /workspace
-ARG INSTALL_CUML=0
+ARG INSTALL_CUML=1
 
 # Change Ubuntu mirror to a reliable one (Cloudflare mirror)
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirror.kakao.com/ubuntu|g' /etc/apt/sources.list
@@ -33,7 +33,7 @@ ENV PATH="/root/.local/bin:${PATH}"
 RUN uv pip install --system -r requirements.txt && \
     uv pip install --system torch-kmeans hdbscan
 
-# Optional GPU HDBSCAN backend (cuML). Disabled by default because it has strict CUDA/runtime constraints.
+# GPU HDBSCAN backend (cuML). Enabled by default; disable with INSTALL_CUML=0 when needed.
 RUN if [ "$INSTALL_CUML" = "1" ]; then \
       uv pip install --system --extra-index-url=https://pypi.nvidia.com cuml-cu12 cupy-cuda12x ; \
     else \

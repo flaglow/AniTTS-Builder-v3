@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 IMAGE_NAME="${IMAGE_NAME:-anitts-builder-v3}"
-INSTALL_CUML="${INSTALL_CUML:-0}"  # Optional: INSTALL_CUML=1 ./setup.sh
+INSTALL_CUML="${INSTALL_CUML:-1}"  # Optional: INSTALL_CUML=0 ./setup.sh
 NO_CACHE="${NO_CACHE:-0}"          # Optional: NO_CACHE=1 ./setup.sh
 
 if ! command -v docker >/dev/null 2>&1; then

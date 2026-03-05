@@ -38,7 +38,7 @@ This program is developed to run through dockers. Please install CUDA 12.1 + CUD
    ./setup.sh
    ```
    - Optional:
-     - `INSTALL_CUML=1 ./setup.sh` (enable cuML install)
+     - `INSTALL_CUML=0 ./setup.sh` (skip cuML install)
      - `NO_CACHE=1 ./setup.sh` (build without Docker cache)
 5. Start the container and create a data folder (e.g. `data_myproject`):
    ```bash

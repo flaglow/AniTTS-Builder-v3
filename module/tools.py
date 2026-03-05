@@ -21,6 +21,13 @@ SUPPORTED_MEDIA_EXTENSIONS = (
     ".wav",
 )
 
+PRETRAINED_MODEL_URLS = {
+    "vocal_models/Kim_MelBandRoformer.ckpt": "https://huggingface.co/Sucial/MSST-WebUI/resolve/main/All_Models/vocal_models/Kim_MelBandRoformer.ckpt",
+    "vocal_models/model_mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt": "https://huggingface.co/Sucial/MSST-WebUI/resolve/main/All_Models/vocal_models/model_mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+    "single_stem_models/denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": "https://huggingface.co/Sucial/MSST-WebUI/resolve/main/All_Models/single_stem_models/denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt",
+    "single_stem_models/dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": "https://huggingface.co/Sucial/MSST-WebUI/resolve/main/All_Models/single_stem_models/dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
+}
+
 
 def _safe_positive_int(value):
     try:
@@ -266,14 +273,7 @@ def download_pretrained_models():
     Download necessary pretrained models from Hugging Face.
     """
     print("[INFO] Starting download of pretrained models.")
-    model_urls = {
-        "vocal_models/Kim_MelBandRoformer.ckpt": "https://huggingface.co/Sucial/MSST-WebUI/resolve/main/All_Models/vocal_models/Kim_MelBandRoformer.ckpt",
-        "vocal_models/model_mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt": "https://huggingface.co/Sucial/MSST-WebUI/resolve/main/All_Models/vocal_models/model_mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
-        "single_stem_models/denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": "https://huggingface.co/Sucial/MSST-WebUI/resolve/main/All_Models/single_stem_models/denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt",
-        "single_stem_models/dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": "https://huggingface.co/Sucial/MSST-WebUI/resolve/main/All_Models/single_stem_models/dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
-    }
-    
-    for filename, url in model_urls.items():
+    for filename, url in PRETRAINED_MODEL_URLS.items():
         save_path = os.path.join("./module/model/MSST_WebUI/pretrain/", filename)
         download_file(url, save_path)
     print("[INFO] All pretrained models have been downloaded.")
