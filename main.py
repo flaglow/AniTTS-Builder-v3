@@ -63,12 +63,12 @@ with gr.Blocks() as demo:
         # -------------------------
         # 2) 자막 파일이 있는 경우
         # -------------------------
-        with gr.Tab("2) 자막 파일이 **있는** 경우 (.ass)"):
+        with gr.Tab("2) 자막 파일이 **있는** 경우 (.ass/.srt/.smi)"):
             gr.Markdown(
-                "### ASS 자막 기반 파이프라인\n"
-                "1. `./data/video` 폴더에 영상 파일을 넣고, **같은 파일 이름의 `.ass` 자막**을 "
+                "### 자막 기반 파이프라인 (ASS/SRT/SMI)\n"
+                "1. `./data/video` 폴더에 영상 파일을 넣고, **같은 파일 이름의 자막(`.ass`, `.srt`, `.smi`)**을 "
                 "`./data/transcribe` 폴더에 넣어 주세요.\n"
-                "   - 예) `[Moozzi2] Steins;Gate - 01 ....mkv` ↔ 같은 이름의 `.ass`\n"
+                "   - 예) `[Moozzi2] Steins;Gate - 01 ....mkv` ↔ 같은 이름의 `.ass` / `.srt` / `.smi`\n"
                 "2. 아래 버튼을 **1 → 5 순서**로 한 번씩 눌러 주세요.\n"
                 "3. Whisper 대신 자막 타임스탬프를 사용하되, 필요 시 자동 싱크 보정(오프셋/드리프트)을 적용합니다."
             )
@@ -77,8 +77,8 @@ with gr.Blocks() as demo:
             btn_ws_msst_wav = gr.Button("3. BGM 제거 (Remove WAV BGM)")
 
             gr.Markdown(
-                "#### ASS 자막으로 음성 조각 만들기\n"
-                "4. ASS 자막의 타임스탬프를 사용해 WAV를 잘게 자르고, "
+                "#### 자막 타임스탬프로 음성 조각 만들기\n"
+                "4. ASS/SRT/SMI 자막의 타임스탬프를 사용해 WAV를 잘게 자르고, "
                 "`./data/transcribe`에 `[화자] 대사` 텍스트를 저장합니다.\n"
                 "- 자동 보정 실패 시 해당 에피소드는 스킵되고 `./logs/ass_sync` 및 "
                 "`sync_profile.json`에 `needs_manual`로 기록됩니다."
@@ -89,11 +89,11 @@ with gr.Blocks() as demo:
             ws_auto_filter = gr.Checkbox(label="4-D. 비대사 자막 자동 필터링", value=True)
             ws_use_profile = gr.Checkbox(label="4-E. sync_profile.json 사용", value=True)
             ws_dry_run = gr.Checkbox(label="4-F. Dry-run (파일 생성 없이 리포트만)", value=False)
-            btn_ws_ass_slice = gr.Button("4. ASS 자막 기준으로 음성 조각 생성 (Slice by ASS Subtitles)")
+            btn_ws_ass_slice = gr.Button("4. 자막 기준으로 음성 조각 생성 (Slice by Subtitles)")
 
             gr.Markdown(
                 "#### 마지막 단계: 화자 클러스터링\n"
-                "5. ASS 기반으로 잘려진 음성 조각들을 임베딩하고, 비슷한 목소리끼리 자동으로 묶습니다."
+                "5. 자막 기반으로 잘려진 음성 조각들을 임베딩하고, 비슷한 목소리끼리 자동으로 묶습니다."
             )
             btn_ws_clustering = gr.Button("5. 화자 임베딩 & 클러스터링 실행 (Run Embeddings & Clustering)")
 
