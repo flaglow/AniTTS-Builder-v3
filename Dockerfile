@@ -35,7 +35,8 @@ RUN uv pip install --system -r requirements.txt && \
 
 # GPU HDBSCAN backend (cuML). Enabled by default; disable with INSTALL_CUML=0 when needed.
 RUN if [ "$INSTALL_CUML" = "1" ]; then \
-      uv pip install --system --extra-index-url=https://pypi.nvidia.com cuml-cu12 cupy-cuda12x ; \
+      uv pip install --system --extra-index-url=https://pypi.nvidia.com cuml-cu12 cupy-cuda12x && \
+      uv pip install --system "nvidia-nvjitlink-cu12==12.9.86" ; \
     else \
       echo "Skipping cuML installation (INSTALL_CUML=0)."; \
     fi
