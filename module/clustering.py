@@ -1,14 +1,244 @@
-import os
 import glob
+import os
 import shutil
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
-import librosa
 
-from sklearn.cluster import DBSCAN
+
+def _safe_int(value, default):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _auto_audio_workers():
+    cpu_count = os.cpu_count() or 4
+    return max(2, min(8, cpu_count // 2))
+
+
+def _auto_copy_workers():
+    cpu_count = os.cpu_count() or 4
+    return max(2, min(32, cpu_count * 2))
+
+
+def _worker_init():
+    # Avoid oversubscription when decoding in multiple processes.
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+
+def _load_and_filter_audio(path, target_sr, max_samples, min_duration, max_duration):
+    try:
+        info = torchaudio.info(path)
+        if info.sample_rate <= 0:
+            return path, None, None, "invalid_sample_rate"
+
+        duration_sec = float(info.num_frames) / float(info.sample_rate)
+        if duration_sec < min_duration or duration_sec > max_duration:
+            return path, None, duration_sec, "out_of_range"
+
+        signal, sr = torchaudio.load(path)
+        if signal.numel() == 0:
+            return path, None, duration_sec, "empty_signal"
+
+        if signal.shape[0] > 1:
+            signal = signal.mean(dim=0, keepdim=True)
+
+        if sr != target_sr:
+            signal = torchaudio.functional.resample(signal, orig_freq=sr, new_freq=target_sr)
+
+        signal = signal[:, :max_samples]
+        audio = signal.squeeze(0).contiguous().numpy().astype(np.float32)
+
+        if audio.size == 0:
+            return path, None, duration_sec, "empty_after_trim"
+
+        return path, audio, duration_sec, None
+    except Exception as exc:
+        return path, None, None, str(exc)
+
+
+def _normalize_embeddings(embeddings):
+    return F.normalize(embeddings.float(), p=2, dim=1)
+
+
+def chunked_cosine_similarity(embeddings, device, chunk_size=512, use_half=False):
+    """
+    Backward-compatible helper for cosine similarity matrix computation.
+    """
+    embeddings = _normalize_embeddings(embeddings)
+    n = embeddings.shape[0]
+    sim_mat = torch.zeros((n, n), dtype=torch.float32)
+
+    for start_i in range(0, n, chunk_size):
+        end_i = min(start_i + chunk_size, n)
+        row = embeddings[start_i:end_i].to(device)
+        if use_half:
+            row = row.half()
+        for start_j in range(0, n, chunk_size):
+            end_j = min(start_j + chunk_size, n)
+            col = embeddings[start_j:end_j].to(device)
+            if use_half:
+                col = col.half()
+            sim_mat[start_i:end_i, start_j:end_j] = torch.matmul(row, col.t()).float().cpu()
+
+    return sim_mat
+
+
+def compute_embeddings(
+    directory,
+    max_audio_length=10.0,
+    min_duration=0.5,
+    max_duration=10.0,
+    cache_dir="./model_cache",
+    target_sr=16000,
+    use_half=False,
+    audio_workers=None,
+    embedding_batch_size=32,
+    prefer_process_pool=True,
+):
+    """
+    Load WAV files, filter by duration, compute embeddings using ReDimNet.
+    Returns normalized embeddings and valid file paths.
+    """
+    total_start = time.perf_counter()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Using device: {device}.")
+
+    os.makedirs(cache_dir, exist_ok=True)
+    torch.hub.set_dir(cache_dir)
+
+    all_wav_files = sorted(glob.glob(os.path.join(directory, "*.wav")))
+    print(f"[INFO] Found {len(all_wav_files)} WAV files in directory: {directory}.")
+    if not all_wav_files:
+        return None, [], [], {"total_s": 0.0}
+
+    max_samples = int(max_audio_length * target_sr)
+    audio_workers = _safe_int(audio_workers, _auto_audio_workers())
+    embedding_batch_size = max(1, _safe_int(embedding_batch_size, 32))
+
+    prepare_start = time.perf_counter()
+    prepared = []
+
+    if prefer_process_pool and audio_workers > 1:
+        try:
+            with ProcessPoolExecutor(max_workers=audio_workers, initializer=_worker_init) as ex:
+                futures = [
+                    ex.submit(
+                        _load_and_filter_audio,
+                        wav_path,
+                        target_sr,
+                        max_samples,
+                        min_duration,
+                        max_duration,
+                    )
+                    for wav_path in all_wav_files
+                ]
+                for fut in as_completed(futures):
+                    prepared.append(fut.result())
+        except Exception as exc:
+            print(f"[WARN] ProcessPool preparation failed, fallback to ThreadPool. error={exc}")
+            prepared = []
+
+    if not prepared:
+        with ThreadPoolExecutor(max_workers=audio_workers) as ex:
+            futures = [
+                ex.submit(
+                    _load_and_filter_audio,
+                    wav_path,
+                    target_sr,
+                    max_samples,
+                    min_duration,
+                    max_duration,
+                )
+                for wav_path in all_wav_files
+            ]
+            for fut in as_completed(futures):
+                prepared.append(fut.result())
+
+    # Restore input order for predictable output.
+    path_to_idx = {p: i for i, p in enumerate(all_wav_files)}
+    prepared.sort(key=lambda item: path_to_idx.get(item[0], 10**12))
+
+    valid_wav_files = []
+    audio_arrays = []
+    for path, audio, duration_sec, error in prepared:
+        if audio is None:
+            if error == "out_of_range":
+                print(f"[INFO] Excluding {path}: duration {duration_sec:.2f}s out of range.")
+            else:
+                print(f"[WARN] Excluding {path}: {error}")
+            continue
+        valid_wav_files.append(path)
+        audio_arrays.append(audio)
+
+    prepare_s = time.perf_counter() - prepare_start
+    if not audio_arrays:
+        print("[WARN] No valid audio files found after filtering.")
+        return None, [], [], {"prepare_audio_s": prepare_s, "total_s": time.perf_counter() - total_start}
+
+    print("[INFO] Loading ReDimNet model from GitHub repository.")
+    model = torch.hub.load(
+        "IDRnD/ReDimNet",
+        "ReDimNet",
+        model_name="b6",
+        train_type="ft_lm",
+        dataset="vox2",
+        source="github",
+        force_reload=False,
+        skip_validation=True,
+    )
+    model.to(device)
+    model.eval()
+    if use_half:
+        model.half()
+    print("[INFO] ReDimNet model loaded successfully.")
+
+    embed_start = time.perf_counter()
+    embedding_chunks = []
+
+    with torch.no_grad():
+        for i in range(0, len(audio_arrays), embedding_batch_size):
+            batch_audio = audio_arrays[i : i + embedding_batch_size]
+            max_len = max(x.shape[0] for x in batch_audio)
+            batch = torch.zeros((len(batch_audio), max_len), dtype=torch.float32)
+            for row_idx, arr in enumerate(batch_audio):
+                n = arr.shape[0]
+                batch[row_idx, :n] = torch.from_numpy(arr)
+
+            batch = batch.to(device)
+            if use_half:
+                batch = batch.half()
+
+            emb = model(batch)
+            if emb.dim() == 1:
+                emb = emb.unsqueeze(0)
+            embedding_chunks.append(emb.float().cpu())
+
+    embeddings = torch.cat(embedding_chunks, dim=0)
+    embeddings = _normalize_embeddings(embeddings)
+    embed_s = time.perf_counter() - embed_start
+
+    total_s = time.perf_counter() - total_start
+    timing = {
+        "prepare_audio_s": prepare_s,
+        "embedding_s": embed_s,
+        "total_s": total_s,
+    }
+    print(f"[INFO] Embedding complete. files={len(valid_wav_files)} timing={timing}")
+
+    # noise_files kept for backward compatibility of downstream API.
+    noise_files = []
+    return embeddings, valid_wav_files, noise_files, timing
+
 
 def compute_embeddings_and_distance(
     directory,
@@ -17,143 +247,249 @@ def compute_embeddings_and_distance(
     chunk_size=512,
     min_duration=0.5,
     max_duration=10.0,
-    cache_dir="./model_cache"  # Model cache directory
+    cache_dir="./model_cache",
 ):
     """
-    Load WAV files, compute embeddings using ReDimNet, and return a cosine distance matrix.
-    Files that fail to load or whose duration is out of the specified range are completely excluded.
+    Backward-compatible API that also returns a cosine distance matrix.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}.")
-
-    # Ensure cache directory exists
-    os.makedirs(cache_dir, exist_ok=True)
-    torch.hub.set_dir(cache_dir)
-
-    print("[INFO] Loading ReDimNet model from GitHub repository.")
-    # Load ReDimNet model with cache directory
-    model = torch.hub.load(
-        "IDRnD/ReDimNet",   # Repository
-        "ReDimNet",         # Function name
-        model_name="b6",    # Model version (e.g., b6)
-        train_type="ft_lm", # Fine-tuned large margin loss version
-        dataset="vox2",     # Pretrained dataset: VOXCELEB2
-        source="github",    # Explicitly specify GitHub as the source
-        force_reload=False, # Avoid redundant downloads
-        skip_validation=True  # Skip unnecessary validation
+    embeddings, valid_wav_files, noise_files, _ = compute_embeddings(
+        directory=directory,
+        max_audio_length=max_audio_length,
+        min_duration=min_duration,
+        max_duration=max_duration,
+        cache_dir=cache_dir,
+        target_sr=16000,
+        use_half=use_half,
+        audio_workers=None,
+        embedding_batch_size=32,
+        prefer_process_pool=True,
     )
-    model.to(device)
-    model.eval()
-    print("[INFO] ReDimNet model loaded successfully.")
 
-    # Find all WAV files in the directory
-    all_wav_files = sorted(glob.glob(os.path.join(directory, "*.wav")))
-    print(f"[INFO] Found {len(all_wav_files)} WAV files in directory: {directory}.")
-    if len(all_wav_files) == 0:
-        print("[WARN] No valid WAV files found.")
-        return None, [], [], None
-
-    def extract_embedding(filepath):
-        """
-        Load audio, compute its duration using librosa, process the audio with torchaudio,
-        and compute the embedding using ReDimNet.
-        If any error occurs during loading or processing, return (None, None) to exclude the file.
-        """
-        try:
-            # Load audio with librosa to determine duration
-            audio_librosa, sr_librosa = librosa.load(filepath, sr=16000)
-            duration_sec = len(audio_librosa) / sr_librosa
-
-            # Load audio with torchaudio for processing
-            signal, sr = torchaudio.load(filepath)
-            if sr != 16000:
-                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-                signal = resampler(signal)
-
-            max_samples = int(max_audio_length * 16000)
-            if signal.shape[1] > max_samples:
-                signal = signal[:, :max_samples]
-
-            if use_half:
-                model.half()
-
-            signal = signal.to(device)
-            with torch.no_grad():
-                emb = model(signal)  # Shape: (1, emb_dim)
-            emb = emb.squeeze(0).cpu()  # Shape: (emb_dim,)
-            return emb, duration_sec
-        except Exception as e:
-            print(f"[ERROR] Failed to process file {filepath} with error: {e}")
-            return None, None
-
-    valid_embeddings = []
-    valid_wav_files = []
-    # noise_files list is maintained for backward compatibility,
-    # but files failing to load or out of range are now excluded (not added here)
-    noise_files = []
-
-    # Process files and compute embeddings
-    for path in all_wav_files:
-        print(f"[INFO] Processing file: {path}.")
-        emb, duration_sec = extract_embedding(path)
-        if emb is None or duration_sec is None:
-            print(f"[INFO] File {path} failed to load; excluding from further processing.")
-            continue
-        if duration_sec < min_duration or duration_sec > max_duration:
-            print(f"[INFO] File {path} duration {duration_sec:.2f}s out of range; excluding from further processing.")
-            continue
-        valid_embeddings.append(emb)
-        valid_wav_files.append(path)
-        print(f"[INFO] File {path} processed successfully with duration {duration_sec:.2f}s.")
-
-    # Exit if no valid embeddings were found
-    if len(valid_embeddings) == 0:
-        print("[WARN] No valid audio files found after filtering.")
+    if embeddings is None or embeddings.shape[0] == 0:
         return None, [], noise_files, None
 
-    embeddings = torch.stack(valid_embeddings, dim=0)  # Shape: (N, D), float32
-
-    print("[INFO] Computing cosine similarity matrix using chunking.")
-    # Compute cosine similarity matrix
-    sim_mat = chunked_cosine_similarity(embeddings, device, chunk_size, use_half)
-    sim_mat = torch.clamp(sim_mat, -1.0, 1.0)  # Clamp values to valid range
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sim_mat = chunked_cosine_similarity(embeddings, device=device, chunk_size=chunk_size, use_half=use_half)
+    sim_mat = torch.clamp(sim_mat, -1.0, 1.0)
     distance_matrix = ((1.0 - sim_mat.numpy()) / 2.0).astype(np.float64)
-    print("[INFO] Cosine similarity matrix computed successfully.")
-
     return distance_matrix, valid_wav_files, noise_files, embeddings
 
 
-def chunked_cosine_similarity(embeddings, device, chunk_size=512, use_half=False):
+def _fit_hdbscan_labels(
+    embeddings_cpu,
+    min_cluster_size=5,
+    min_samples=None,
+    cluster_selection_epsilon=0.0,
+    prefer_gpu_hdbscan=True,
+):
     """
-    Compute the cosine similarity matrix (N, N) for an embedding tensor (N, D) using chunking.
+    Fit HDBSCAN using cuML on GPU when available, otherwise sklearn fallback.
+    Returns labels (np.ndarray) and backend name.
     """
-    N, D = embeddings.shape
-    norms = torch.norm(embeddings, p=2, dim=1, keepdim=True)
-    sim_mat = torch.zeros(N, N, dtype=torch.float32)
+    x_np = embeddings_cpu.detach().cpu().numpy().astype(np.float32)
 
-    for start_i in range(0, N, chunk_size):
-        end_i = min(start_i + chunk_size, N)
-        print(f"[INFO] Processing similarity for rows {start_i} to {end_i}.")
-        row_emb = embeddings[start_i:end_i].to(device)
-        row_norm = norms[start_i:end_i].to(device)
-        if use_half:
-            row_emb = row_emb.half()
-            row_norm = row_norm.half()
+    if prefer_gpu_hdbscan and torch.cuda.is_available():
+        try:
+            import cupy as cp
+            from cuml.cluster import HDBSCAN as CuHDBSCAN
 
-        for start_j in range(0, N, chunk_size):
-            end_j = min(start_j + chunk_size, N)
-            col_emb = embeddings[start_j:end_j].to(device)
-            col_norm = norms[start_j:end_j].to(device)
-            if use_half:
-                col_emb = col_emb.half()
-                col_norm = col_norm.half()
+            x_gpu = cp.asarray(x_np)
+            model = CuHDBSCAN(
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
+                metric="euclidean",
+                cluster_selection_epsilon=cluster_selection_epsilon,
+            )
+            labels_gpu = model.fit_predict(x_gpu)
+            labels = cp.asnumpy(labels_gpu).astype(np.int64)
+            return labels, "cuml"
+        except Exception as exc:
+            print(f"[WARN] cuML HDBSCAN unavailable, fallback to sklearn. error={exc}")
 
-            dot_chunk = torch.matmul(row_emb, col_emb.transpose(0, 1))
-            denom = torch.matmul(row_norm, col_norm.transpose(0, 1))
-            cos_chunk = dot_chunk / (denom + 1e-9)
-            sim_mat[start_i:end_i, start_j:end_j] = cos_chunk.float().cpu()
+    try:
+        from sklearn.cluster import HDBSCAN as SkHDBSCAN
 
-    return sim_mat
+        model = SkHDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric="euclidean",
+            cluster_selection_epsilon=cluster_selection_epsilon,
+        )
+        labels = model.fit_predict(x_np).astype(np.int64)
+        return labels, "sklearn"
+    except Exception as exc:
+        raise RuntimeError(f"No available HDBSCAN backend. error={exc}") from exc
+
+
+def _compute_centroids_from_labels(x_cpu, labels_cpu, k):
+    d = x_cpu.shape[1]
+    centroids = torch.zeros((k, d), dtype=x_cpu.dtype)
+    counts = torch.zeros(k, dtype=torch.long)
+
+    centroids.index_add_(0, labels_cpu, x_cpu)
+    counts.index_add_(0, labels_cpu, torch.ones_like(labels_cpu, dtype=torch.long))
+
+    nonzero = counts > 0
+    centroids[nonzero] = centroids[nonzero] / counts[nonzero].unsqueeze(1)
+    centroids[nonzero] = _normalize_embeddings(centroids[nonzero])
+    return centroids, counts
+
+
+def _kmeans_vectorized_cpu(x_cpu, init_centroids_cpu, max_iters=100, tol=1e-4):
+    centroids = _normalize_embeddings(init_centroids_cpu.clone())
+
+    for iter_idx in range(1, max_iters + 1):
+        similarity = torch.matmul(x_cpu, centroids.t())
+        labels = torch.argmax(similarity, dim=1)
+
+        new_centroids, counts = _compute_centroids_from_labels(x_cpu, labels, centroids.shape[0])
+        empty = counts == 0
+        if empty.any():
+            new_centroids[empty] = centroids[empty]
+
+        if torch.allclose(centroids, new_centroids, atol=tol):
+            print(f"[INFO] CPU vectorized K-Means converged at iteration={iter_idx}.")
+            centroids = new_centroids
+            break
+
+        centroids = new_centroids
+
+    return labels, centroids
+
+
+def _try_torch_kmeans(x_cpu, k, max_iters=100):
+    """
+    Try torch_kmeans on GPU. Returns (labels_cpu, backend_name) or (None, None) on failure.
+    """
+    if not torch.cuda.is_available():
+        return None, None
+
+    try:
+        from torch_kmeans import KMeans
+
+        x_gpu = x_cpu.to("cuda").unsqueeze(0)
+        model = KMeans(n_clusters=k, max_iter=max_iters, verbose=False)
+
+        labels = None
+        if hasattr(model, "fit_predict"):
+            pred = model.fit_predict(x_gpu)
+            labels = pred
+        else:
+            out = model(x_gpu)
+            if hasattr(out, "labels"):
+                labels = out.labels
+            elif isinstance(out, (tuple, list)) and len(out) > 0:
+                labels = out[0]
+
+        if labels is None:
+            return None, None
+
+        labels = labels.squeeze(0).detach().to("cpu").long()
+        if labels.ndim != 1 or labels.numel() != x_cpu.shape[0]:
+            return None, None
+
+        return labels, "torch_kmeans"
+    except Exception as exc:
+        print(f"[WARN] torch_kmeans unavailable, fallback to CPU vectorized K-Means. error={exc}")
+        return None, None
+
+
+def hdbscan_kmeans_clustering(
+    embeddings,
+    valid_wav_files,
+    noise_files,
+    destination_folder,
+    hdbscan_min_cluster_size=5,
+    hdbscan_min_samples=None,
+    cluster_selection_epsilon=0.0,
+    max_distance=0.2,
+    kmeans_max_iters=100,
+    prefer_gpu_hdbscan=True,
+    prefer_gpu_kmeans=True,
+    cpu_math_threads=None,
+    copy_workers=None,
+):
+    """
+    Cluster data using HDBSCAN, then refine non-noise points with K-Means.
+    Final noise is enforced by both HDBSCAN and centroid distance threshold.
+    """
+    total_start = time.perf_counter()
+
+    if embeddings is None or embeddings.shape[0] == 0:
+        return finalize_clustering([], valid_wav_files, noise_files, destination_folder, copy_workers=copy_workers)
+
+    if cpu_math_threads is not None:
+        torch.set_num_threads(max(1, _safe_int(cpu_math_threads, torch.get_num_threads())))
+
+    x_cpu = _normalize_embeddings(embeddings.cpu())
+
+    hdbscan_start = time.perf_counter()
+    base_labels, hdbscan_backend = _fit_hdbscan_labels(
+        x_cpu,
+        min_cluster_size=hdbscan_min_cluster_size,
+        min_samples=hdbscan_min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        prefer_gpu_hdbscan=prefer_gpu_hdbscan,
+    )
+    hdbscan_s = time.perf_counter() - hdbscan_start
+    print(f"[INFO] HDBSCAN backend={hdbscan_backend}, clusters={set(base_labels.tolist())}")
+
+    non_noise_indices = np.where(base_labels != -1)[0]
+    if non_noise_indices.size == 0:
+        print("[WARN] HDBSCAN found only noise.")
+        print(f"[INFO] timing={{'hdbscan_s': {hdbscan_s:.3f}, 'total_s': {time.perf_counter() - total_start:.3f}}}")
+        return finalize_clustering(base_labels, valid_wav_files, noise_files, destination_folder, copy_workers=copy_workers)
+
+    non_noise_label_values = sorted(set(base_labels[non_noise_indices].tolist()))
+    label_to_local = {label: i for i, label in enumerate(non_noise_label_values)}
+
+    x_non_noise = x_cpu[non_noise_indices]
+    local_labels_from_hdbscan = torch.tensor(
+        [label_to_local[int(base_labels[idx])] for idx in non_noise_indices], dtype=torch.long
+    )
+
+    k = len(non_noise_label_values)
+    init_centroids = []
+    for original_label in non_noise_label_values:
+        mask = torch.tensor(base_labels[non_noise_indices] == original_label, dtype=torch.bool)
+        init_centroids.append(x_non_noise[mask].mean(dim=0))
+    init_centroids = torch.stack(init_centroids, dim=0)
+
+    kmeans_start = time.perf_counter()
+    labels_local = None
+    kmeans_backend = None
+
+    if prefer_gpu_kmeans:
+        labels_local, kmeans_backend = _try_torch_kmeans(x_non_noise, k, max_iters=kmeans_max_iters)
+
+    if labels_local is None:
+        labels_local, _ = _kmeans_vectorized_cpu(
+            x_non_noise,
+            init_centroids,
+            max_iters=kmeans_max_iters,
+            tol=1e-4,
+        )
+        kmeans_backend = "cpu_vectorized"
+
+    centroids, _ = _compute_centroids_from_labels(x_non_noise, labels_local, k)
+    picked_centroids = centroids[labels_local]
+    cosine_dist = ((1.0 - (x_non_noise * picked_centroids).sum(dim=1).clamp(-1.0, 1.0)) / 2.0).cpu().numpy()
+    distance_noise = cosine_dist > max_distance
+    kmeans_s = time.perf_counter() - kmeans_start
+
+    final_labels = np.full(x_cpu.shape[0], -1, dtype=np.int64)
+    final_labels[non_noise_indices] = labels_local.cpu().numpy().astype(np.int64)
+    final_labels[non_noise_indices[distance_noise]] = -1
+    final_labels[base_labels == -1] = -1
+
+    total_s = time.perf_counter() - total_start
+    print(
+        "[INFO] Clustering timing="
+        f"{{'hdbscan_s': {hdbscan_s:.3f}, 'kmeans_s': {kmeans_s:.3f}, 'total_s': {total_s:.3f}}}, "
+        f"hdbscan_backend={hdbscan_backend}, kmeans_backend={kmeans_backend}"
+    )
+
+    return finalize_clustering(final_labels, valid_wav_files, noise_files, destination_folder, copy_workers=copy_workers)
 
 
 def dbscan_kmeans_clustering(
@@ -168,81 +504,34 @@ def dbscan_kmeans_clustering(
     max_iters=100,
 ):
     """
-    Cluster the data using DBSCAN followed by a variant of K-Means with noise handling.
+    Backward-compatible wrapper. DBSCAN path is replaced by HDBSCAN path.
+    distance_matrix/eps are accepted for compatibility but not used.
     """
-    print("[INFO] Starting DBSCAN clustering.")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    db = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed").fit(distance_matrix)
-    labels = db.labels_  # DBSCAN labels; -1 indicates noise
-    core_sample_mask = np.zeros_like(labels, dtype=bool)
-    core_sample_mask[db.core_sample_indices_] = True
-    unique_labels = set(labels)
-    print(f"[INFO] DBSCAN clustering completed. Unique labels found: {unique_labels}.")
-
-    # Collect core and overall sample indices for each cluster (excluding noise)
-    clusters_core_indices = {}
-    clusters_all_indices = {}
-    for label in unique_labels:
-        if label == -1:
-            continue
-        core_indices = np.where((labels == label) & core_sample_mask)[0]
-        all_indices = np.where(labels == label)[0]
-        clusters_core_indices[label] = core_indices
-        clusters_all_indices[label] = all_indices
-
-    # Set initial centroids: use the first core sample from each cluster (or first sample if core not available)
-    k = len(clusters_core_indices.keys())
-    if k == 0:
-        print("[WARN] No clusters found from DBSCAN; all files classified as noise.")
-        return finalize_clustering(labels, valid_wav_files, noise_files, destination_folder)
-
-    initial_centroid_indices = []
-    for lbl, core_inds in clusters_core_indices.items():
-        if len(core_inds) > 0:
-            initial_centroid_indices.append(core_inds[0])
-        else:
-            initial_centroid_indices.append(clusters_all_indices[lbl][0])
-    print(f"[INFO] Initial centroid indices determined: {initial_centroid_indices}.")
-
-    X_start_cpu = embeddings[initial_centroid_indices]  # Shape: (k, D)
-
-    print("[INFO] Starting K-Means variant with noise handling.")
-    centroids_result, clusters_result, noise_points_result = kmeans_with_noise(
-        embeddings, X_start_cpu, k, cos_distance, max_distance=max_distance, max_iters=max_iters
+    _ = distance_matrix, eps
+    return hdbscan_kmeans_clustering(
+        embeddings=embeddings,
+        valid_wav_files=valid_wav_files,
+        noise_files=noise_files,
+        destination_folder=destination_folder,
+        hdbscan_min_cluster_size=max(2, min_samples),
+        hdbscan_min_samples=min_samples,
+        cluster_selection_epsilon=0.0,
+        max_distance=max_distance,
+        kmeans_max_iters=max_iters,
+        prefer_gpu_hdbscan=True,
+        prefer_gpu_kmeans=True,
     )
-    print("[INFO] K-Means variant completed.")
-
-    # Construct final labels: default label is -1 (noise)
-    N = embeddings.shape[0]
-    labels_kmeans = np.full(N, -1, dtype=int)
-
-    for cluster_idx, idx_list in enumerate(clusters_result):
-        for idx in idx_list:
-            labels_kmeans[idx] = cluster_idx
-
-    # Mark points flagged as noise by the K-Means variant
-    for idx, is_noise in enumerate(noise_points_result):
-        if is_noise:
-            labels_kmeans[idx] = -1
-
-    # Enforce DBSCAN noise labels
-    for i, lbl in enumerate(labels):
-        if lbl == -1:
-            labels_kmeans[i] = -1
-
-    return finalize_clustering(labels_kmeans, valid_wav_files, noise_files, destination_folder)
 
 
 def cos_distance(a, b):
     """
-    Compute the cosine distance between two 1-D tensors.
+    Backward-compatible cosine distance helper for 1D tensors.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    a_ = a.unsqueeze(0).to(device)
-    b_ = b.unsqueeze(0).to(device)
-    sim = F.cosine_similarity(a_, b_, dim=-1).clamp(-1.0, 1.0)
+    a_n = F.normalize(a.float().unsqueeze(0), p=2, dim=1)
+    b_n = F.normalize(b.float().unsqueeze(0), p=2, dim=1)
+    sim = (a_n * b_n).sum(dim=1).clamp(-1.0, 1.0)
     dist = (1.0 - sim) / 2.0
-    return dist.cpu().item()
+    return float(dist.item())
 
 
 def kmeans_with_noise(
@@ -254,60 +543,40 @@ def kmeans_with_noise(
     max_iters=100,
 ):
     """
-    Perform a variant of K-Means clustering with noise detection.
+    Backward-compatible K-Means variant wrapper using vectorized CPU implementation.
     """
-    N = embeddings_cpu.shape[0]
-    # Pair each index with its corresponding embedding
-    X_pairs = [[idx, embeddings_cpu[idx]] for idx in range(N)]
+    _ = distance_func
+    if embeddings_cpu is None or embeddings_cpu.shape[0] == 0:
+        return centroids_cpu, [[] for _ in range(max(0, k))], np.array([], dtype=bool)
 
-    centroids_curr = centroids_cpu.clone()  # Shape: (k, D)
-    for iter_idx in range(1, max_iters + 1):
-        clusters = [[] for _ in range(k)]
-        noise_points = np.full(N, False)
+    x = _normalize_embeddings(embeddings_cpu.cpu())
+    c = _normalize_embeddings(centroids_cpu.cpu())
+    labels, centroids = _kmeans_vectorized_cpu(x, c, max_iters=max_iters, tol=1e-4)
 
-        # Assign each point to the nearest centroid or mark it as noise
-        for pair in X_pairs:
-            idx_data, x_cpu = pair
-            distances = [distance_func(x_cpu, centroids_curr[c_idx]) for c_idx in range(k)]
-            best_cluster = np.argmin(distances)
-            if distances[best_cluster] > max_distance:
-                noise_points[idx_data] = True
-            else:
-                clusters[best_cluster].append([idx_data, x_cpu])
+    picked_centroids = centroids[labels]
+    cosine_dist = ((1.0 - (x * picked_centroids).sum(dim=1).clamp(-1.0, 1.0)) / 2.0).cpu().numpy()
+    noise_points = cosine_dist > max_distance
 
-        # Update centroids as the mean of points in each cluster
-        new_centroids = []
-        for cluster_idx in range(k):
-            if len(clusters[cluster_idx]) > 0:
-                emb_list = [x for (_, x) in clusters[cluster_idx]]
-                emb_stack = torch.stack(emb_list, dim=0).float()
-                centroid = emb_stack.mean(dim=0)
-                new_centroids.append(centroid)
-            else:
-                new_centroids.append(centroids_curr[cluster_idx])
-
-        new_centroids_cpu = torch.stack(new_centroids, dim=0)
-        print(f"[INFO] K-Means iteration {iter_idx} completed.")
-        if torch.allclose(centroids_curr, new_centroids_cpu, atol=1e-3):
-            print("[INFO] Convergence reached in K-Means clustering.")
-            centroids_curr = new_centroids_cpu
-            break
-        centroids_curr = new_centroids_cpu
-
-    # Prepare final clusters based on point indices
     idx_clusters = []
     for cluster_idx in range(k):
-        idx_in_cluster = [pair[0] for pair in clusters[cluster_idx]]
+        idx_in_cluster = torch.where(labels == cluster_idx)[0].cpu().numpy().tolist()
         idx_clusters.append(idx_in_cluster)
 
-    return centroids_curr, idx_clusters, noise_points
+    return centroids, idx_clusters, noise_points
 
 
-def finalize_clustering(labels, valid_wav_files, noise_files, destination_folder):
+def _copy_file(src_path, dest_path):
+    try:
+        shutil.copy(src_path, dest_path)
+        return src_path, dest_path, None
+    except Exception as exc:
+        return src_path, dest_path, str(exc)
+
+
+def finalize_clustering(labels, valid_wav_files, noise_files, destination_folder, copy_workers=None):
     """
     Create cluster folders and copy WAV files based on the clustering labels.
     """
-    # noise_files is expected to be empty if files failing to load were excluded.
     labels_total = list(labels) + ([-1] * len(noise_files))
     all_files = valid_wav_files + noise_files
 
@@ -322,6 +591,7 @@ def finalize_clustering(labels, valid_wav_files, noise_files, destination_folder
             cluster_folder = os.path.join(destination_folder, f"clustering_{lbl}")
         os.makedirs(cluster_folder, exist_ok=True)
 
+    copy_tasks = []
     for path, lbl in zip(all_files, labels_total):
         if lbl == -1:
             cluster_folder = os.path.join(destination_folder, "noise")
@@ -329,8 +599,25 @@ def finalize_clustering(labels, valid_wav_files, noise_files, destination_folder
             cluster_folder = os.path.join(destination_folder, f"clustering_{lbl}")
         file_name = os.path.basename(path)
         dest_path = os.path.join(cluster_folder, file_name)
-        shutil.copy(path, dest_path)
-        print(f"[INFO] Copied file {file_name} to: {dest_path}.")
+        copy_tasks.append((path, dest_path))
+
+    copy_workers = _safe_int(copy_workers, _auto_copy_workers())
+    if copy_workers <= 1:
+        for src_path, dest_path in copy_tasks:
+            _, _, err = _copy_file(src_path, dest_path)
+            if err:
+                print(f"[WARN] Failed to copy {src_path} -> {dest_path}: {err}")
+            else:
+                print(f"[INFO] Copied file to: {dest_path}.")
+    else:
+        with ThreadPoolExecutor(max_workers=copy_workers) as ex:
+            futures = [ex.submit(_copy_file, src, dst) for src, dst in copy_tasks]
+            for fut in as_completed(futures):
+                src_path, dest_path, err = fut.result()
+                if err:
+                    print(f"[WARN] Failed to copy {src_path} -> {dest_path}: {err}")
+                else:
+                    print(f"[INFO] Copied file to: {dest_path}.")
 
     print("[INFO] Clustering complete.")
     return labels_total
@@ -358,41 +645,61 @@ def remove_small_clusters(destination_folder, min_files=10):
     print("[INFO] Cleanup complete.")
 
 
-def clustering_for_main(wav_folder, output_folder, cache_dir):
+def clustering_for_main(
+    wav_folder,
+    output_folder,
+    cache_dir,
+    hdbscan_min_cluster_size=5,
+    hdbscan_min_samples=None,
+    cluster_selection_epsilon=0.0,
+    max_distance=0.2,
+    kmeans_max_iters=100,
+    prefer_gpu_hdbscan=True,
+    prefer_gpu_kmeans=True,
+    audio_workers=None,
+    embedding_batch_size=32,
+    cpu_math_threads=None,
+    copy_workers=None,
+):
     """
     Main function to run clustering process.
     """
     print(f"[INFO] Starting clustering process for WAV folder: {wav_folder}.")
-    # Step 1: Compute embeddings and distance matrix
-    distance_matrix, valid_wav_files, noise_files, embeddings = compute_embeddings_and_distance(
+
+    embeddings, valid_wav_files, noise_files, embed_timing = compute_embeddings(
         directory=wav_folder,
         max_audio_length=10.0,
-        use_half=False,
-        chunk_size=512,
         min_duration=0.5,
         max_duration=10.0,
-        cache_dir=cache_dir
+        cache_dir=cache_dir,
+        target_sr=16000,
+        use_half=False,
+        audio_workers=audio_workers,
+        embedding_batch_size=embedding_batch_size,
+        prefer_process_pool=True,
     )
 
-    # Check if there are valid files to process
-    if distance_matrix is None or embeddings is None or len(valid_wav_files) == 0:
+    if embeddings is None or len(valid_wav_files) == 0:
         print("[WARN] No valid audio files found for clustering.")
-    else:
-        # Step 2: Perform clustering
-        print("[INFO] Performing DBSCAN and K-Means clustering.")
-        labels = dbscan_kmeans_clustering(
-            distance_matrix=distance_matrix,
-            embeddings=embeddings,
-            valid_wav_files=valid_wav_files,
-            noise_files=noise_files,
-            destination_folder=output_folder,
-            eps=0.2,          # DBSCAN hyperparameter
-            min_samples=2,    # DBSCAN hyperparameter
-            max_distance=0.2, # K-Means noise threshold
-            max_iters=100     # Maximum iterations for K-Means
-        )
+        return
 
-        # Step 3: Remove small clusters
-        print("[INFO] Removing small clusters (folders with insufficient files).")
-        remove_small_clusters(destination_folder=output_folder, min_files=10)
-        print("[INFO] Clustering process completed.")
+    print("[INFO] Performing HDBSCAN + K-Means clustering.")
+    hdbscan_kmeans_clustering(
+        embeddings=embeddings,
+        valid_wav_files=valid_wav_files,
+        noise_files=noise_files,
+        destination_folder=output_folder,
+        hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+        hdbscan_min_samples=hdbscan_min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        max_distance=max_distance,
+        kmeans_max_iters=kmeans_max_iters,
+        prefer_gpu_hdbscan=prefer_gpu_hdbscan,
+        prefer_gpu_kmeans=prefer_gpu_kmeans,
+        cpu_math_threads=cpu_math_threads,
+        copy_workers=copy_workers,
+    )
+
+    print("[INFO] Removing small clusters (folders with insufficient files).")
+    remove_small_clusters(destination_folder=output_folder, min_files=10)
+    print(f"[INFO] Clustering process completed. embedding_timing={embed_timing}")
