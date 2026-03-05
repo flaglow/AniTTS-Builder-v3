@@ -486,3 +486,53 @@
 09:37:23.387 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:168] Saved other for [Moozzi2] Steins;Gate - 25 OVA (BD 1920x1080 x.265 Flac)_other.wav in ./data/audio_wav
 09:37:23.394 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:274] Running garbage collection...
 09:37:23.558 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:280] Clearing CUDA cache...
+13:38:23.976 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:88] Operating System: Linux #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025
+13:38:23.977 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:91] Python Version: 3.11.9
+13:38:23.978 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:94] PyTorch Version: 2.4.1+cu121
+13:38:24.017 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:100] FFmpeg installed: ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers
+13:38:24.074 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:63] CUDA is available in Torch, setting Torch device to CUDA
+13:38:24.075 [INFO] [module/model/MSST_WebUI/inference/msst_infer.py:72] Using device: cuda:0, device_ids: [0]
+13:38:25.625 [INFO] [module/model/MSST_WebUI/inference/msst_infer.py:108] Separator params: model_type: mel_band_roformer, model_path: /workspace/AniTTS-Builder-v3/module/model/MSST_WebUI/pretrain/vocal_models/Kim_MelBandRoformer.ckpt, config_path: /workspace/AniTTS-Builder-v3/module/model/MSST_WebUI/configs_backup/vocal_models/config_Kim_MelBandRoformer.yaml
+13:38:25.625 [INFO] [module/model/MSST_WebUI/inference/msst_infer.py:109] Separator params: output_folder: ./data/audio_wav, output_format: wav
+13:38:25.626 [INFO] [module/model/MSST_WebUI/inference/msst_infer.py:110] Model params: instruments: ['vocals', 'other'], target_instrument: vocals
+13:38:25.626 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:111] Model params: batch_size: 1, num_overlap: 4, dim_t: 256, normalize: None, use_tta: False
+13:38:30.020 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:125] Loading model completed, duration: 5.94 seconds
+13:38:30.023 [INFO] [module/model/MSST_WebUI/inference/msst_infer.py:134] Input_folder: ./data/audio_wav, Total files found: 24
+13:38:55.324 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:157] Starting separation process for audio_file: ./data/audio_wav/[Moozzi2] Steins;Gate - 01 (BD 1920x1080 x.265 Flac).wav
+13:38:55.324 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:182] Target instrument is not null, set primary_stem to target_instrument, secondary_stem will be calculated by mix - target_instrument
+13:40:14.547 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:203] Finished demixing tracks.
+13:40:14.675 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:219] Starting to extract waveforms for instruments: ['vocals']
+13:40:14.675 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:233] target_instrument is not null, extracting instrumental from vocals, other_instruments: ['other']
+13:40:14.766 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:245] Separation process completed.
+13:40:14.771 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:159] Separation audio_file: ./data/audio_wav/[Moozzi2] Steins;Gate - 01 (BD 1920x1080 x.265 Flac).wav completed. Starting to save results.
+13:40:17.809 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:168] Saved vocals for [Moozzi2] Steins;Gate - 01 (BD 1920x1080 x.265 Flac)_vocals.wav in ./data/audio_wav
+13:40:20.733 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:168] Saved other for [Moozzi2] Steins;Gate - 01 (BD 1920x1080 x.265 Flac)_other.wav in ./data/audio_wav
+13:40:46.058 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:157] Starting separation process for audio_file: ./data/audio_wav/[Moozzi2] Steins;Gate - 02 (BD 1920x1080 x.265 Flac).wav
+13:40:46.058 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:182] Target instrument is not null, set primary_stem to target_instrument, secondary_stem will be calculated by mix - target_instrument
+13:42:06.228 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:203] Finished demixing tracks.
+13:42:06.358 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:219] Starting to extract waveforms for instruments: ['vocals']
+13:42:06.359 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:233] target_instrument is not null, extracting instrumental from vocals, other_instruments: ['other']
+13:42:06.452 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:245] Separation process completed.
+13:42:06.462 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:159] Separation audio_file: ./data/audio_wav/[Moozzi2] Steins;Gate - 02 (BD 1920x1080 x.265 Flac).wav completed. Starting to save results.
+13:42:09.258 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:168] Saved vocals for [Moozzi2] Steins;Gate - 02 (BD 1920x1080 x.265 Flac)_vocals.wav in ./data/audio_wav
+13:42:12.059 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:168] Saved other for [Moozzi2] Steins;Gate - 02 (BD 1920x1080 x.265 Flac)_other.wav in ./data/audio_wav
+13:42:37.405 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:157] Starting separation process for audio_file: ./data/audio_wav/[Moozzi2] Steins;Gate - 03 (BD 1920x1080 x.265 Flac).wav
+13:42:37.406 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:182] Target instrument is not null, set primary_stem to target_instrument, secondary_stem will be calculated by mix - target_instrument
+13:43:56.838 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:203] Finished demixing tracks.
+13:43:56.961 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:219] Starting to extract waveforms for instruments: ['vocals']
+13:43:56.962 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:233] target_instrument is not null, extracting instrumental from vocals, other_instruments: ['other']
+13:43:57.043 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:245] Separation process completed.
+13:43:57.051 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:159] Separation audio_file: ./data/audio_wav/[Moozzi2] Steins;Gate - 03 (BD 1920x1080 x.265 Flac).wav completed. Starting to save results.
+13:43:59.771 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:168] Saved vocals for [Moozzi2] Steins;Gate - 03 (BD 1920x1080 x.265 Flac)_vocals.wav in ./data/audio_wav
+13:44:02.513 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:168] Saved other for [Moozzi2] Steins;Gate - 03 (BD 1920x1080 x.265 Flac)_other.wav in ./data/audio_wav
+13:44:27.860 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:157] Starting separation process for audio_file: ./data/audio_wav/[Moozzi2] Steins;Gate - 04 (BD 1920x1080 x.265 Flac).wav
+13:44:27.861 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:182] Target instrument is not null, set primary_stem to target_instrument, secondary_stem will be calculated by mix - target_instrument
+13:45:52.104 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:203] Finished demixing tracks.
+13:45:52.521 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:219] Starting to extract waveforms for instruments: ['vocals']
+13:45:52.522 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:233] target_instrument is not null, extracting instrumental from vocals, other_instruments: ['other']
+13:45:52.628 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:245] Separation process completed.
+13:45:52.637 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:159] Separation audio_file: ./data/audio_wav/[Moozzi2] Steins;Gate - 04 (BD 1920x1080 x.265 Flac).wav completed. Starting to save results.
+13:45:55.384 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:168] Saved vocals for [Moozzi2] Steins;Gate - 04 (BD 1920x1080 x.265 Flac)_vocals.wav in ./data/audio_wav
+13:45:58.223 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:168] Saved other for [Moozzi2] Steins;Gate - 04 (BD 1920x1080 x.265 Flac)_other.wav in ./data/audio_wav
+13:46:24.088 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:157] Starting separation process for audio_file: ./data/audio_wav/[Moozzi2] Steins;Gate - 05 (BD 1920x1080 x.265 Flac).wav
+13:46:24.088 [DEBUG] [module/model/MSST_WebUI/inference/msst_infer.py:182] Target instrument is not null, set primary_stem to target_instrument, secondary_stem will be calculated by mix - target_instrument
