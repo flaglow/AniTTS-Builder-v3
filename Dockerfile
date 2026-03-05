@@ -25,14 +25,17 @@ RUN apt-get clean && \
 WORKDIR /workspace/AniTTS-Builder-v3
 COPY . /workspace/AniTTS-Builder-v3
 
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
 # Install Python dependencies
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt && \
-    pip install torch-kmeans hdbscan
+RUN uv pip install --system -r requirements.txt && \
+    uv pip install --system torch-kmeans hdbscan
 
 # Optional GPU HDBSCAN backend (cuML). Disabled by default because it has strict CUDA/runtime constraints.
 RUN if [ "$INSTALL_CUML" = "1" ]; then \
-      pip install --extra-index-url=https://pypi.nvidia.com cuml-cu12 cupy-cuda12x ; \
+      uv pip install --system --extra-index-url=https://pypi.nvidia.com cuml-cu12 cupy-cuda12x ; \
     else \
       echo "Skipping cuML installation (INSTALL_CUML=0)."; \
     fi
