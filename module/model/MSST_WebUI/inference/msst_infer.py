@@ -13,6 +13,19 @@ from pydub import AudioSegment
 
 from utils.utils import demix, get_model_from_config
 from utils.logger import get_logger, set_log_level
+from utils.system_resources import collect_resource_snapshot, recommend_batch_size, format_snapshot
+
+
+def _safe_int(value, default):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _is_oom_error(exc):
+    text = str(exc).lower()
+    return "out of memory" in text
 
 class MSSeparator:
     def __init__(
@@ -136,10 +149,59 @@ class MSSeparator:
         if not self.debug:
             all_mixtures_path = tqdm(all_mixtures_path, desc="Total progress")
 
+        auto_parallel_enabled = bool(getattr(self, "_anittts_auto_parallel_enabled", False))
+        auto_parallel_mode = getattr(self, "_anittts_auto_parallel_mode", "safe")
+        auto_parallel_max_batch = _safe_int(getattr(self, "_anittts_auto_parallel_max_batch", 4), 4)
+        auto_parallel_max_batch = max(1, auto_parallel_max_batch)
+        auto_parallel_probe_interval = _safe_int(getattr(self, "_anittts_auto_parallel_probe_interval_files", 1), 1)
+        auto_parallel_probe_interval = max(1, auto_parallel_probe_interval)
+        auto_parallel_log = bool(getattr(self, "_anittts_auto_parallel_log", True))
+        base_batch_size = _safe_int(self.config.inference.get("batch_size", 1), 1)
+        base_batch_size = max(1, base_batch_size)
+        self.config.inference["batch_size"] = base_batch_size
+
+        if auto_parallel_enabled:
+            self.logger.info(
+                "[AUTO] Resource-aware parallel enabled: "
+                f"mode={auto_parallel_mode}, "
+                f"base_batch={base_batch_size}, "
+                f"max_batch={auto_parallel_max_batch}, "
+                f"probe_interval_files={auto_parallel_probe_interval}"
+            )
+
+        device_id = None
+        if "cuda" in str(self.device).lower():
+            if ":" in str(self.device):
+                try:
+                    device_id = int(str(self.device).split(":")[-1])
+                except Exception:
+                    device_id = None
+            if device_id is None and self.device_ids:
+                device_id = _safe_int(self.device_ids[0], 0)
+
         success_files = []
-        for path in all_mixtures_path:
+        for file_idx, path in enumerate(all_mixtures_path, start=1):
             if not self.debug:
                 all_mixtures_path.set_postfix({'track': os.path.basename(path)})
+
+            if auto_parallel_enabled and ((file_idx - 1) % auto_parallel_probe_interval == 0):
+                snapshot = collect_resource_snapshot(device_id=device_id)
+                current_batch_size = _safe_int(self.config.inference.get("batch_size", base_batch_size), base_batch_size)
+                current_batch_size = max(1, current_batch_size)
+                next_batch_size = recommend_batch_size(
+                    base_batch=base_batch_size,
+                    current_batch=current_batch_size,
+                    snapshot=snapshot,
+                    max_batch=auto_parallel_max_batch,
+                )
+                if next_batch_size != current_batch_size:
+                    self.config.inference["batch_size"] = next_batch_size
+                    if auto_parallel_log:
+                        self.logger.info(
+                            f"[AUTO] {format_snapshot(snapshot)} -> batch_size {current_batch_size} -> {next_batch_size}"
+                        )
+                elif auto_parallel_log:
+                    self.logger.debug(f"[AUTO] {format_snapshot(snapshot)} -> batch_size {current_batch_size}")
 
             try:
                 mix, sr = librosa.load(path, sr=44100, mono=False)
@@ -155,7 +217,35 @@ class MSSeparator:
                 self.logger.warning(f"Track {path} has more than 2 channels, taking mean of all channels. As a result, the output instruments will be mono but in stereo format.")
 
             self.logger.debug(f"Starting separation process for audio_file: {path}")
-            results = self.separate(mix)
+            oom_retry_count = 0
+            max_oom_retries = 3
+            while True:
+                try:
+                    results = self.separate(mix)
+                    break
+                except Exception as exc:
+                    current_batch_size = _safe_int(self.config.inference.get("batch_size", 1), 1)
+                    current_batch_size = max(1, current_batch_size)
+                    if (
+                        (not auto_parallel_enabled)
+                        or (not _is_oom_error(exc))
+                        or current_batch_size <= 1
+                        or oom_retry_count >= max_oom_retries
+                    ):
+                        raise
+
+                    next_batch_size = max(1, current_batch_size // 2)
+                    if next_batch_size >= current_batch_size:
+                        next_batch_size = current_batch_size - 1
+                    next_batch_size = max(1, next_batch_size)
+                    oom_retry_count += 1
+                    self.logger.warning(
+                        "[AUTO] CUDA OOM while processing "
+                        f"{path}. Reducing batch_size {current_batch_size} -> {next_batch_size} "
+                        f"and retrying ({oom_retry_count}/{max_oom_retries})."
+                    )
+                    self.config.inference["batch_size"] = next_batch_size
+                    self.del_cache()
             self.logger.debug(f"Separation audio_file: {path} completed. Starting to save results.")
 
             file_name, _ = os.path.splitext(os.path.basename(path))

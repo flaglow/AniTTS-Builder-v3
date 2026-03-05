@@ -7,6 +7,45 @@ from module.memory_cleanup import release_torch_resources
 from module.model.MSST_WebUI.inference.msst_infer import MSSeparator
 from module.model.MSST_WebUI.utils.logger import get_logger
 
+
+def _env_flag(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_int(name, default, minimum=1):
+    raw = os.getenv(name)
+    if raw is None:
+        return max(minimum, default)
+    try:
+        return max(minimum, int(raw))
+    except Exception:
+        return max(minimum, default)
+
+
+def _configure_auto_parallel(separator):
+    """
+    Enable resource-aware safe auto-parallel only for the main pipeline path.
+    """
+    auto_enabled = _env_flag("ANITTS_MSST_AUTO_PARALLEL", True)
+    separator._anittts_auto_parallel_enabled = auto_enabled
+    separator._anittts_auto_parallel_mode = "safe"
+    separator._anittts_auto_parallel_max_batch = _env_int("ANITTS_MSST_AUTO_MAX_BATCH", 4, minimum=1)
+    separator._anittts_auto_parallel_probe_interval_files = _env_int("ANITTS_MSST_AUTO_PROBE_INTERVAL", 1, minimum=1)
+    separator._anittts_auto_parallel_log = _env_flag("ANITTS_MSST_AUTO_LOG", True)
+
+    if auto_enabled:
+        print(
+            "[INFO] MSST auto parallel enabled "
+            f"(mode=safe, max_batch={separator._anittts_auto_parallel_max_batch}, "
+            f"probe_interval={separator._anittts_auto_parallel_probe_interval_files})."
+        )
+    else:
+        print("[INFO] MSST auto parallel disabled by ANITTS_MSST_AUTO_PARALLEL.")
+
+
 def load_separator(model, model_type, folder_path):
     """
     Initialize MSSeparator with specified model and parameters.
@@ -29,6 +68,7 @@ def load_separator(model, model_type, folder_path):
         logger=logger,
         debug=True
     )
+    _configure_auto_parallel(separator)
     print("[INFO] MSSeparator initialized successfully.")
     return separator
 
