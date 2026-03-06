@@ -2,6 +2,7 @@ import glob
 import os
 import shutil
 import time
+import csv
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -12,11 +13,98 @@ import torchaudio
 from module.memory_cleanup import release_torch_resources
 
 
+CLUSTERING_MANIFEST_FILENAME = "clustering_slices.csv"
+SLICE_MANIFEST_FILENAMES = ("whisper_slices.csv", "subtitle_slices.csv")
+
+
 def _safe_int(value, default):
     try:
         return int(value)
     except Exception:
         return default
+
+
+def _load_slice_metadata_by_filename(data_dir):
+    metadata = {}
+    for manifest_name in SLICE_MANIFEST_FILENAMES:
+        manifest_path = os.path.join(data_dir, manifest_name)
+        if not os.path.exists(manifest_path):
+            continue
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    filename = (row.get("filename") or "").strip()
+                    if not filename:
+                        continue
+                    metadata[filename] = {
+                        "index": str(row.get("index") or "").strip(),
+                        "timestamp_start": str(row.get("timestamp_start") or "").strip(),
+                        "timestamp_end": str(row.get("timestamp_end") or "").strip(),
+                        "transcript": str(row.get("transcript") or "").strip(),
+                    }
+        except Exception as exc:
+            print(f"[WARN] Failed to read slice manifest: {manifest_path}. error={exc}")
+
+    return metadata
+
+
+def export_clustering_manifest(wav_folder, destination_folder, included_filenames=None):
+    data_dir = os.path.dirname(os.path.abspath(wav_folder))
+    manifest_path = os.path.join(data_dir, CLUSTERING_MANIFEST_FILENAME)
+    metadata_by_file = _load_slice_metadata_by_filename(data_dir)
+
+    include_set = None
+    if included_filenames is not None:
+        include_set = {os.path.basename(name) for name in included_filenames}
+
+    assignments = {}
+    if os.path.isdir(destination_folder):
+        for cluster_name in sorted(os.listdir(destination_folder)):
+            cluster_path = os.path.join(destination_folder, cluster_name)
+            if not os.path.isdir(cluster_path):
+                continue
+            for file_name in sorted(os.listdir(cluster_path)):
+                if not file_name.lower().endswith(".wav"):
+                    continue
+                if include_set is not None and file_name not in include_set:
+                    continue
+
+                file_path = os.path.join(cluster_path, file_name)
+                try:
+                    mtime = os.path.getmtime(file_path)
+                except OSError:
+                    mtime = 0.0
+
+                prev = assignments.get(file_name)
+                if prev is None or mtime >= prev[1]:
+                    assignments[file_name] = (cluster_name, mtime)
+
+    rows = []
+    for file_name in sorted(assignments):
+        cluster_name, _ = assignments[file_name]
+        meta = metadata_by_file.get(file_name, {})
+        rows.append(
+            [
+                file_name,
+                meta.get("index", ""),
+                meta.get("timestamp_start", ""),
+                meta.get("timestamp_end", ""),
+                meta.get("transcript", ""),
+                cluster_name,
+            ]
+        )
+
+    with open(manifest_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["filename", "index", "timestamp_start", "timestamp_end", "transcript", "cluster_dir"]
+        )
+        writer.writerows(rows)
+
+    print(f"[INFO] Saved clustering manifest: {manifest_path} (rows={len(rows)}).")
+    return manifest_path, len(rows)
 
 
 def _auto_audio_workers():
@@ -706,6 +794,11 @@ def clustering_for_main(
 
         if embeddings is None or len(valid_wav_files) == 0:
             print("[WARN] No valid audio files found for clustering.")
+            export_clustering_manifest(
+                wav_folder=wav_folder,
+                destination_folder=output_folder,
+                included_filenames=[],
+            )
             return
 
         print("[INFO] Performing HDBSCAN + K-Means clustering.")
@@ -727,6 +820,11 @@ def clustering_for_main(
 
         print("[INFO] Removing small clusters (folders with insufficient files).")
         remove_small_clusters(destination_folder=output_folder, min_files=10)
+        export_clustering_manifest(
+            wav_folder=wav_folder,
+            destination_folder=output_folder,
+            included_filenames=[os.path.basename(p) for p in (valid_wav_files + noise_files)],
+        )
         print(f"[INFO] Clustering process completed. embedding_timing={embed_timing}")
     finally:
         embeddings = None

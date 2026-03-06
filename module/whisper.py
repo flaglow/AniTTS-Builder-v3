@@ -1,4 +1,5 @@
 import os
+import csv
 import torch
 import torchaudio
 from transformers import pipeline, WhisperProcessor, WhisperForConditionalGeneration
@@ -6,6 +7,14 @@ import numpy as np
 from glob import glob
 
 from module.memory_cleanup import release_torch_resources
+
+
+def _write_slice_manifest(csv_path, rows):
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "index", "timestamp_start", "timestamp_end", "transcript"])
+        writer.writerows(rows)
 
 def load_model(model_id, cache_dir):
     """
@@ -127,7 +136,13 @@ def extract_timestamps(
 
                 for i in result['chunks']:
                     if i['timestamp'] and i['timestamp'][0] is not None and i['timestamp'][1] is not None and i['timestamp'][0] < i['timestamp'][1] < 30:
-                        temp_timestamps.append((i['timestamp'][0] + savetime, i['timestamp'][1] + savetime))
+                        temp_timestamps.append(
+                            {
+                                "start": i['timestamp'][0] + savetime,
+                                "end": i['timestamp'][1] + savetime,
+                                "text": (i.get("text") or "").strip(),
+                            }
+                        )
                         savetime = i['timestamp'][1]
 
                 segment = segment[int(savetime * samplerate):]
@@ -138,7 +153,14 @@ def extract_timestamps(
                 continue
 
             print(f"[INFO] Extracted {len(temp_timestamps)} timestamps from segment {segment_index+1}.")
-            refined_timestamps += [(start + ts[0], start + ts[1]) for ts in temp_timestamps]
+            refined_timestamps += [
+                {
+                    "start": start + ts["start"],
+                    "end": start + ts["end"],
+                    "text": ts["text"],
+                }
+                for ts in temp_timestamps
+            ]
 
         print("[INFO] Timestamp extraction complete.")
         return refined_timestamps
@@ -150,18 +172,32 @@ def save_slices(info, wav_output_dir):
     """
     Save sliced audio segments and corresponding transcriptions.
     """
-    idx = 0
+    manifest_rows = []
     print("[INFO] Saving sliced audio segments.")
     for (wavfile, timestamps) in info:
         print(f"[INFO] Saving slices for file: {wavfile}")
+        base_name = os.path.splitext(os.path.basename(wavfile))[0]
+        local_idx = 0
         waveform, sample_rate = torchaudio.load(wavfile)
         waveform = waveform.mean(dim=0, keepdim=True) if waveform.shape[0] > 1 else waveform
 
-        for (start, end) in timestamps:
+        for item in timestamps:
+            if isinstance(item, dict):
+                start = float(item.get("start", 0.0))
+                end = float(item.get("end", 0.0))
+                transcript = str(item.get("text", "") or "").strip()
+            else:
+                start = float(item[0])
+                end = float(item[1])
+                transcript = str(item[2] if len(item) > 2 else "").strip()
             sliced_waveform = waveform[:, int(start * sample_rate):int(end * sample_rate)]
-            output_path = os.path.join(wav_output_dir, f"{str(idx).zfill(5)}.wav")
+            output_name = f"{base_name}_{local_idx:06d}.wav"
+            output_path = os.path.join(wav_output_dir, output_name)
             torchaudio.save(output_path, sliced_waveform, sample_rate)
-            idx+=1
+            manifest_rows.append(
+                [output_name, local_idx, f"{start:.6f}", f"{end:.6f}", transcript]
+            )
+            local_idx += 1
             print(f"[INFO] Saved slice to {output_path}.")
 
         os.remove(wavfile)
@@ -171,6 +207,13 @@ def save_slices(info, wav_output_dir):
         os.remove(os.path.join(*parts))
         print(f"[INFO] Removed original file: {wavfile}.")
         print(f"[INFO] Removed original file: {os.path.join(*parts)}.")
+
+    manifest_path = os.path.join(
+        os.path.dirname(os.path.abspath(wav_output_dir)),
+        "whisper_slices.csv",
+    )
+    _write_slice_manifest(manifest_path, manifest_rows)
+    print(f"[INFO] Saved whisper slice manifest: {manifest_path} (rows={len(manifest_rows)}).")
     print("[INFO] All slices saved.")
 
 def process_audio_files(input_folder, output_dir, cache_dir, model_id):

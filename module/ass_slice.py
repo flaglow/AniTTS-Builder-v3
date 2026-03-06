@@ -1,6 +1,7 @@
 import html
 import os
 import re
+import csv
 import torchaudio
 
 DATA_DIR = "./data"
@@ -386,6 +387,18 @@ def parse_subtitle_dialogues(path):
         return _parse_smi_dialogues_from_text(text), subtitle_format
     return [], None
 
+
+def _write_slice_manifest_csv(out_dir: str, rows):
+    manifest_path = os.path.join(
+        os.path.dirname(os.path.abspath(out_dir)),
+        "subtitle_slices.csv",
+    )
+    with open(manifest_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "index", "timestamp_start", "timestamp_end", "transcript"])
+        writer.writerows(rows)
+    return manifest_path
+
 def run_ass_slice(
     dry_run: bool = False,
     auto_filter_non_dialogue: bool = True,
@@ -413,6 +426,7 @@ def run_ass_slice(
 
     global_idx = 0
     total_slices = 0
+    manifest_rows = []
 
     for job in subtitle_jobs:
         base = job["base"]
@@ -470,6 +484,7 @@ def run_ass_slice(
             waveform = waveform.mean(dim=0, keepdim=True)  # mono
 
         episode_slice_count = 0
+        local_idx = 0
         for d in slice_candidates:
             start_s = d["start"]
             end_s = d["end"]
@@ -497,6 +512,10 @@ def run_ass_slice(
                 actor = _extract_actor(d)
                 tf.write(f"[{actor}] {d['text']}\n")
 
+            manifest_rows.append(
+                [wav_out_name, local_idx, f"{start_s:.6f}", f"{end_s:.6f}", d["text"]]
+            )
+            local_idx += 1
             global_idx += 1
             episode_slice_count += 1
 
@@ -510,6 +529,12 @@ def run_ass_slice(
     print(
         f"[INFO] 자막 기반 슬라이싱이 완료되었습니다. total_slices={total_slices}, dry_run={dry_run}"
     )
+    if not dry_run:
+        manifest_path = _write_slice_manifest_csv(OUT_DIR, manifest_rows)
+        print(
+            f"[INFO] Saved subtitle slice manifest: {manifest_path} "
+            f"(rows={len(manifest_rows)})."
+        )
 
 if __name__ == "__main__":
     run_ass_slice()
