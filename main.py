@@ -287,7 +287,8 @@ with gr.Blocks() as demo:
             gr.Markdown(
                 "#### 타임스탬프 생성 단계 (Whisper 사용)\n"
                 "4. BGM이 제거된 WAV를 MP3로 변환합니다.\n"
-                "5. Whisper로 음성을 인식해 발화 구간을 자동으로 잘라냅니다."
+                "5. Whisper로 음성을 인식해 발화 구간을 자동으로 잘라내고, "
+                "`./data/whisper_slices.csv`에 파일명/인덱스/타임스탬프/전사 텍스트를 저장합니다."
             )
             btn_ns_convert_mp3 = gr.Button("4. WAV를 MP3로 변환 (Convert to MP3)")
             txt_model_id = gr.Textbox(
@@ -298,7 +299,8 @@ with gr.Blocks() as demo:
 
             gr.Markdown(
                 "#### 마지막 단계: 화자 클러스터링\n"
-                "6. 잘려진 음성 조각들을 임베딩하고, 비슷한 목소리끼리 자동으로 묶습니다."
+                "6. 잘려진 음성 조각들을 임베딩하고, 비슷한 목소리끼리 자동으로 묶은 뒤 "
+                "`./data/clustering_slices.csv`에 클러스터 디렉토리를 함께 저장합니다."
             )
             btn_ns_clustering = gr.Button("6. 화자 임베딩 & 클러스터링 실행 (Run Embeddings & Clustering)")
 
@@ -321,7 +323,8 @@ with gr.Blocks() as demo:
             gr.Markdown(
                 "#### 자막 타임스탬프로 음성 조각 만들기\n"
                 "4. ASS/SRT/SMI 자막의 타임스탬프를 사용해 WAV를 잘게 자르고, "
-                "`./data/transcribe`에 `[화자] 대사` 텍스트를 저장합니다."
+                "`./data/transcribe`에 `[화자] 대사` 텍스트와 "
+                "`./data/subtitle_slices.csv`에 파일명/인덱스/타임스탬프/전사 텍스트를 저장합니다."
             )
             ws_auto_filter = gr.Checkbox(label="4-A. 비대사 자막 자동 필터링", value=True)
             ws_dry_run = gr.Checkbox(label="4-B. Dry-run (파일 생성 없이 개수만 확인)", value=False)
@@ -329,7 +332,8 @@ with gr.Blocks() as demo:
 
             gr.Markdown(
                 "#### 마지막 단계: 화자 클러스터링\n"
-                "5. 자막 기반으로 잘려진 음성 조각들을 임베딩하고, 비슷한 목소리끼리 자동으로 묶습니다."
+                "5. 자막 기반으로 잘려진 음성 조각들을 임베딩하고, 비슷한 목소리끼리 자동으로 묶은 뒤 "
+                "`./data/clustering_slices.csv`에 클러스터 디렉토리를 함께 저장합니다."
             )
             btn_ws_clustering = gr.Button("5. 화자 임베딩 & 클러스터링 실행 (Run Embeddings & Clustering)")
 

@@ -27,3 +27,6 @@ __pycache__/
 data*
 
 *.ckpt
+logs
+module/model/whisper/.locks/
+module/model/whisper/models--openai--whisper-large-v3/
