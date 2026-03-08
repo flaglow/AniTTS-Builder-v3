@@ -7,7 +7,7 @@ from module.tools import (
 )
 from module.whisper import process_audio_files
 from module.msst import msst_for_main
-from module.clustering import clustering_for_main
+from module.clustering import clustering_for_main, refresh_clustering_manifest_cluster_dirs
 from module.ass_slice import run_ass_slice
 import os
 import time
@@ -253,6 +253,36 @@ def stage_clustering(wav_folder, result_folder, embeddings_cache_dir, pipeline_n
         _stage_log_fail(stage_name, started_at, input_files=input_count, output_files=output_before, error=exc)
         raise
 
+
+def stage_refresh_cluster_dirs(manifest_path, result_folder):
+    stage_name = "Utility#1 Refresh cluster_dir"
+    input_count = _count_wavs_recursive(result_folder)
+    started_at = time.perf_counter()
+    _stage_log_start(
+        stage_name,
+        input_files=input_count,
+        extra=f"manifest_path={manifest_path} result_folder={result_folder}",
+    )
+    try:
+        manifest_path, rows_count, changed_rows, added_rows, missing_rows = refresh_clustering_manifest_cluster_dirs(
+            manifest_path=manifest_path,
+            destination_folder=result_folder,
+            append_missing_rows=True,
+        )
+        _stage_log_done(
+            stage_name,
+            started_at,
+            input_files=input_count,
+            output_files=rows_count,
+            extra=(
+                f"manifest_path={manifest_path} changed_rows={changed_rows} "
+                f"added_rows={added_rows} missing_rows={missing_rows}"
+            ),
+        )
+    except Exception as exc:
+        _stage_log_fail(stage_name, started_at, input_files=input_count, error=exc)
+        raise
+
 with gr.Blocks() as demo:
     gr.Markdown("## AniTTS Builder-v3")
     gr.Markdown(
@@ -266,6 +296,8 @@ with gr.Blocks() as demo:
     result_folder = gr.Textbox(value="./data/result", interactive=False, visible=False)
     whisper_cache_dir = gr.Textbox(value="./module/model/whisper", interactive=False, visible=False)
     embeddings_cache_dir = gr.Textbox(value="./module/model/redimmet", interactive=False, visible=False)
+    refresh_manifest_path = gr.Textbox(value="./data_mydata/clustering_slices.csv", interactive=False, visible=False)
+    refresh_result_folder = gr.Textbox(value="./data_mydata/result", interactive=False, visible=False)
     # 버튼 활성화 상태 저장용 state 추가
     button_state = gr.State(value=True)
 
@@ -337,6 +369,12 @@ with gr.Blocks() as demo:
             )
             btn_ws_clustering = gr.Button("5. 화자 임베딩 & 클러스터링 실행 (Run Embeddings & Clustering)")
 
+    gr.Markdown(
+        "### 유틸리티\n"
+        "`./data_mydata/clustering_slices.csv`의 `cluster_dir`를 현재 `./data_mydata/result` 구조로 최신화합니다."
+    )
+    btn_refresh_cluster_dirs = gr.Button("클러스터 디렉토리 리프래시 (Refresh cluster_dir)")
+
     # 모든 버튼을 리스트에 저장
     all_buttons = [
         btn_ns_convert_wav,
@@ -350,6 +388,7 @@ with gr.Blocks() as demo:
         btn_ws_msst_wav,
         btn_ws_ass_slice,
         btn_ws_clustering,
+        btn_refresh_cluster_dirs,
     ]
 
     # 모든 버튼 비활성화 함수
@@ -417,6 +456,14 @@ with gr.Blocks() as demo:
         .then(
             lambda w, r, c: stage_clustering(w, r, c, "Sub", 5),
             inputs=[wav_folder, result_folder, embeddings_cache_dir],
+            outputs=[],
+        ) \
+        .then(lambda: enable_all(), outputs=all_buttons + [button_state])
+
+    btn_refresh_cluster_dirs.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
+        .then(
+            stage_refresh_cluster_dirs,
+            inputs=[refresh_manifest_path, refresh_result_folder],
             outputs=[],
         ) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])

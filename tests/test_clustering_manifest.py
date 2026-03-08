@@ -2,6 +2,7 @@ import csv
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 
@@ -124,6 +125,78 @@ class TestClusteringManifest(unittest.TestCase):
         self.assertEqual(by_name["ep03_000000.wav"]["timestamp_start"], "")
         self.assertEqual(by_name["ep03_000000.wav"]["timestamp_end"], "")
         self.assertEqual(by_name["ep03_000000.wav"]["transcript"], "")
+
+    def test_refresh_clustering_manifest_cluster_dirs_updates_existing_and_appends_missing(self):
+        clustering_csv = os.path.join(self.data_dir, "clustering_slices.csv")
+        subtitle_csv = os.path.join(self.data_dir, "subtitle_slices.csv")
+
+        self._write_csv(
+            clustering_csv,
+            ["filename", "index", "timestamp_start", "timestamp_end", "transcript", "cluster_dir"],
+            [
+                ["ep01_000000.wav", "0", "1.0", "1.5", "hello", "clustering_old"],
+                ["ep02_000000.wav", "1", "2.0", "2.5", "bye", "clustering_old"],
+            ],
+        )
+        self._write_csv(
+            subtitle_csv,
+            ["filename", "index", "timestamp_start", "timestamp_end", "transcript"],
+            [["ep03_000000.wav", "2", "3.0", "3.5", "new line"]],
+        )
+
+        self._touch_wav(os.path.join(self.result_dir, "clustering_5"), "ep01_000000.wav")
+        self._touch_wav(os.path.join(self.result_dir, "noise"), "ep03_000000.wav")
+
+        _, rows_count, changed_rows, added_rows, missing_rows = clustering.refresh_clustering_manifest_cluster_dirs(
+            manifest_path=clustering_csv,
+            destination_folder=self.result_dir,
+            append_missing_rows=True,
+            manifest_scan_workers=1,
+            prefer_process_pool=False,
+        )
+
+        self.assertEqual(rows_count, 3)
+        self.assertEqual(changed_rows, 2)
+        self.assertEqual(added_rows, 1)
+        self.assertEqual(missing_rows, 1)
+
+        with open(clustering_csv, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        by_name = {r["filename"]: r for r in rows}
+
+        self.assertEqual(by_name["ep01_000000.wav"]["cluster_dir"], "clustering_5")
+        self.assertEqual(by_name["ep02_000000.wav"]["cluster_dir"], "")
+        self.assertEqual(by_name["ep03_000000.wav"]["cluster_dir"], "noise")
+        self.assertEqual(by_name["ep03_000000.wav"]["index"], "2")
+        self.assertEqual(by_name["ep03_000000.wav"]["timestamp_start"], "3.0")
+        self.assertEqual(by_name["ep03_000000.wav"]["timestamp_end"], "3.5")
+        self.assertEqual(by_name["ep03_000000.wav"]["transcript"], "new line")
+
+    def test_refresh_clustering_manifest_uses_latest_file_mtime_for_duplicate_filenames(self):
+        clustering_csv = os.path.join(self.data_dir, "clustering_slices.csv")
+        self._write_csv(
+            clustering_csv,
+            ["filename", "index", "timestamp_start", "timestamp_end", "transcript", "cluster_dir"],
+            [["dup.wav", "0", "0.0", "1.0", "dup", "old_cluster"]],
+        )
+
+        old_path = self._touch_wav(os.path.join(self.result_dir, "clustering_1"), "dup.wav")
+        new_path = self._touch_wav(os.path.join(self.result_dir, "clustering_2"), "dup.wav")
+        now = time.time()
+        os.utime(old_path, (now - 100, now - 100))
+        os.utime(new_path, (now, now))
+
+        clustering.refresh_clustering_manifest_cluster_dirs(
+            manifest_path=clustering_csv,
+            destination_folder=self.result_dir,
+            append_missing_rows=False,
+            manifest_scan_workers=1,
+            prefer_process_pool=False,
+        )
+
+        with open(clustering_csv, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(rows[0]["cluster_dir"], "clustering_2")
 
 
 if __name__ == "__main__":

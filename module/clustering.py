@@ -50,7 +50,92 @@ def _load_slice_metadata_by_filename(data_dir):
     return metadata
 
 
-def export_clustering_manifest(wav_folder, destination_folder, included_filenames=None):
+def _auto_manifest_scan_workers():
+    cpu_count = os.cpu_count() or 4
+    return max(2, min(16, cpu_count))
+
+
+def _scan_cluster_directory(cluster_name, cluster_path):
+    scanned_rows = []
+    try:
+        with os.scandir(cluster_path) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                file_name = entry.name
+                if not file_name.lower().endswith(".wav"):
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                scanned_rows.append((file_name, cluster_name, mtime))
+    except Exception as exc:
+        return cluster_name, [], str(exc)
+    return cluster_name, scanned_rows, None
+
+
+def _collect_cluster_assignments(
+    destination_folder,
+    include_set=None,
+    manifest_scan_workers=None,
+    prefer_process_pool=True,
+):
+    assignments = {}
+    if not os.path.isdir(destination_folder):
+        return assignments
+
+    cluster_dirs = []
+    with os.scandir(destination_folder) as entries:
+        for entry in entries:
+            if entry.is_dir():
+                cluster_dirs.append((entry.name, entry.path))
+    cluster_dirs.sort(key=lambda item: item[0])
+    if not cluster_dirs:
+        return assignments
+
+    def _consume(scanned_rows):
+        for file_name, cluster_name, mtime in scanned_rows:
+            if include_set is not None and file_name not in include_set:
+                continue
+            prev = assignments.get(file_name)
+            if prev is None or mtime >= prev[1]:
+                assignments[file_name] = (cluster_name, mtime)
+
+    worker_count = _safe_int(manifest_scan_workers, _auto_manifest_scan_workers())
+    use_process_pool = bool(prefer_process_pool) and worker_count > 1 and len(cluster_dirs) > 1
+
+    if use_process_pool:
+        max_workers = max(1, min(worker_count, len(cluster_dirs)))
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                futures = [ex.submit(_scan_cluster_directory, name, path) for name, path in cluster_dirs]
+                for fut in as_completed(futures):
+                    cluster_name, scanned_rows, err = fut.result()
+                    if err:
+                        print(f"[WARN] Failed to scan cluster directory: {cluster_name}. error={err}")
+                        continue
+                    _consume(scanned_rows)
+            return assignments
+        except Exception as exc:
+            print(f"[WARN] ProcessPool scan failed, fallback to single process. error={exc}")
+
+    for cluster_name, cluster_path in cluster_dirs:
+        _, scanned_rows, err = _scan_cluster_directory(cluster_name, cluster_path)
+        if err:
+            print(f"[WARN] Failed to scan cluster directory: {cluster_name}. error={err}")
+            continue
+        _consume(scanned_rows)
+    return assignments
+
+
+def export_clustering_manifest(
+    wav_folder,
+    destination_folder,
+    included_filenames=None,
+    manifest_scan_workers=None,
+    prefer_process_pool=True,
+):
     data_dir = os.path.dirname(os.path.abspath(wav_folder))
     manifest_path = os.path.join(data_dir, CLUSTERING_MANIFEST_FILENAME)
     metadata_by_file = _load_slice_metadata_by_filename(data_dir)
@@ -59,27 +144,12 @@ def export_clustering_manifest(wav_folder, destination_folder, included_filename
     if included_filenames is not None:
         include_set = {os.path.basename(name) for name in included_filenames}
 
-    assignments = {}
-    if os.path.isdir(destination_folder):
-        for cluster_name in sorted(os.listdir(destination_folder)):
-            cluster_path = os.path.join(destination_folder, cluster_name)
-            if not os.path.isdir(cluster_path):
-                continue
-            for file_name in sorted(os.listdir(cluster_path)):
-                if not file_name.lower().endswith(".wav"):
-                    continue
-                if include_set is not None and file_name not in include_set:
-                    continue
-
-                file_path = os.path.join(cluster_path, file_name)
-                try:
-                    mtime = os.path.getmtime(file_path)
-                except OSError:
-                    mtime = 0.0
-
-                prev = assignments.get(file_name)
-                if prev is None or mtime >= prev[1]:
-                    assignments[file_name] = (cluster_name, mtime)
+    assignments = _collect_cluster_assignments(
+        destination_folder=destination_folder,
+        include_set=include_set,
+        manifest_scan_workers=manifest_scan_workers,
+        prefer_process_pool=prefer_process_pool,
+    )
 
     rows = []
     for file_name in sorted(assignments):
@@ -105,6 +175,88 @@ def export_clustering_manifest(wav_folder, destination_folder, included_filename
 
     print(f"[INFO] Saved clustering manifest: {manifest_path} (rows={len(rows)}).")
     return manifest_path, len(rows)
+
+
+def refresh_clustering_manifest_cluster_dirs(
+    manifest_path,
+    destination_folder,
+    append_missing_rows=True,
+    manifest_scan_workers=None,
+    prefer_process_pool=True,
+):
+    manifest_path = os.path.abspath(manifest_path)
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+
+    with open(manifest_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    if "filename" not in fieldnames:
+        raise ValueError(f"'filename' column is missing in manifest: {manifest_path}")
+    if "cluster_dir" not in fieldnames:
+        fieldnames.append("cluster_dir")
+
+    data_dir = os.path.dirname(manifest_path)
+    metadata_by_file = _load_slice_metadata_by_filename(data_dir)
+
+    assignments = _collect_cluster_assignments(
+        destination_folder=destination_folder,
+        include_set=None,
+        manifest_scan_workers=manifest_scan_workers,
+        prefer_process_pool=prefer_process_pool,
+    )
+
+    seen_names = set()
+    changed_rows = 0
+    missing_rows = 0
+    for row in rows:
+        file_name = str(row.get("filename") or "").strip()
+        if not file_name:
+            continue
+        seen_names.add(file_name)
+
+        new_cluster_dir = assignments.get(file_name, ("", 0.0))[0]
+        old_cluster_dir = str(row.get("cluster_dir") or "").strip()
+        if old_cluster_dir != new_cluster_dir:
+            changed_rows += 1
+        row["cluster_dir"] = new_cluster_dir
+        if not new_cluster_dir:
+            missing_rows += 1
+
+    added_rows = 0
+    if append_missing_rows:
+        for file_name in sorted(assignments):
+            if file_name in seen_names:
+                continue
+            cluster_name, _ = assignments[file_name]
+            meta = metadata_by_file.get(file_name, {})
+            row = {field: "" for field in fieldnames}
+            row["filename"] = file_name
+            if "index" in row:
+                row["index"] = meta.get("index", "")
+            if "timestamp_start" in row:
+                row["timestamp_start"] = meta.get("timestamp_start", "")
+            if "timestamp_end" in row:
+                row["timestamp_end"] = meta.get("timestamp_end", "")
+            if "transcript" in row:
+                row["transcript"] = meta.get("transcript", "")
+            row["cluster_dir"] = cluster_name
+            rows.append(row)
+            added_rows += 1
+
+    with open(manifest_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(
+        "[INFO] Refreshed cluster_dir in manifest: "
+        f"{manifest_path} (rows={len(rows)}, changed_rows={changed_rows}, "
+        f"added_rows={added_rows}, missing_rows={missing_rows})."
+    )
+    return manifest_path, len(rows), changed_rows, added_rows, missing_rows
 
 
 def _auto_audio_workers():
