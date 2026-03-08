@@ -14,7 +14,24 @@ from module.memory_cleanup import release_torch_resources
 
 
 CLUSTERING_MANIFEST_FILENAME = "clustering_slices.csv"
+CLUSTERING_EMBEDDINGS_FILENAME = "clustering_embeddings.npz"
 SLICE_MANIFEST_FILENAMES = ("whisper_slices.csv", "subtitle_slices.csv")
+
+
+def clustering_embeddings_store_path_from_manifest(manifest_path):
+    manifest_path = os.path.abspath(manifest_path)
+    data_dir = os.path.dirname(manifest_path)
+    return os.path.join(data_dir, CLUSTERING_EMBEDDINGS_FILENAME)
+
+
+def clustering_embeddings_store_path_from_wav_folder(wav_folder):
+    data_dir = os.path.dirname(os.path.abspath(wav_folder))
+    return os.path.join(data_dir, CLUSTERING_EMBEDDINGS_FILENAME)
+
+
+def clustering_embeddings_store_path_from_result_folder(result_folder):
+    data_dir = os.path.dirname(os.path.abspath(result_folder))
+    return os.path.join(data_dir, CLUSTERING_EMBEDDINGS_FILENAME)
 
 
 def _safe_int(value, default):
@@ -259,6 +276,220 @@ def refresh_clustering_manifest_cluster_dirs(
     return manifest_path, len(rows), changed_rows, added_rows, missing_rows
 
 
+def _normalize_embedding_vector_np(vector):
+    arr = np.asarray(vector, dtype=np.float32)
+    if arr.ndim != 1 or arr.size == 0:
+        return None
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-12:
+        return None
+    return (arr / norm).astype(np.float32)
+
+
+def load_clustering_embeddings_store(store_path):
+    store_path = os.path.abspath(store_path)
+    if not os.path.exists(store_path):
+        return {}
+
+    try:
+        with np.load(store_path, allow_pickle=False) as data:
+            filenames = data.get("filenames")
+            embeddings = data.get("embeddings")
+
+            if filenames is None or embeddings is None:
+                print(f"[WARN] Invalid embeddings store (missing keys): {store_path}")
+                return {}
+            if embeddings.ndim != 2 or filenames.shape[0] != embeddings.shape[0]:
+                print(f"[WARN] Invalid embeddings store (shape mismatch): {store_path}")
+                return {}
+
+            loaded = {}
+            for idx, raw_name in enumerate(filenames.tolist()):
+                file_name = str(raw_name or "").strip()
+                if not file_name:
+                    continue
+                vec = _normalize_embedding_vector_np(embeddings[idx])
+                if vec is None:
+                    continue
+                loaded[file_name] = vec
+            return loaded
+    except Exception as exc:
+        print(f"[WARN] Failed to load embeddings store: {store_path}. error={exc}")
+        return {}
+
+
+def save_clustering_embeddings_store(store_path, embeddings_by_filename):
+    store_path = os.path.abspath(store_path)
+    os.makedirs(os.path.dirname(store_path), exist_ok=True)
+
+    cleaned = []
+    dim = None
+    for file_name in sorted(embeddings_by_filename.keys()):
+        clean_name = str(file_name or "").strip()
+        if not clean_name:
+            continue
+        vec = _normalize_embedding_vector_np(embeddings_by_filename[file_name])
+        if vec is None:
+            continue
+        if dim is None:
+            dim = vec.shape[0]
+        if vec.shape[0] != dim:
+            print(
+                f"[WARN] Skip embedding due to dim mismatch: filename={clean_name} "
+                f"dim={vec.shape[0]} expected={dim}"
+            )
+            continue
+        cleaned.append((clean_name, vec))
+
+    if not cleaned:
+        filenames_arr = np.array([], dtype=np.str_)
+        embeddings_arr = np.empty((0, 0), dtype=np.float32)
+    else:
+        filenames_arr = np.array([name for name, _ in cleaned], dtype=np.str_)
+        embeddings_arr = np.stack([vec for _, vec in cleaned], axis=0).astype(np.float32)
+
+    tmp_path = f"{store_path}.tmp"
+    with open(tmp_path, "wb") as f:
+        np.savez_compressed(
+            f,
+            filenames=filenames_arr,
+            embeddings=embeddings_arr,
+        )
+    os.replace(tmp_path, store_path)
+
+    return len(cleaned)
+
+
+def upsert_clustering_embeddings_store(
+    store_path,
+    new_embeddings_by_filename,
+    existing_embeddings=None,
+    skip_existing=True,
+):
+    merged = dict(existing_embeddings) if existing_embeddings is not None else load_clustering_embeddings_store(store_path)
+
+    added = 0
+    updated = 0
+    for file_name, vector in new_embeddings_by_filename.items():
+        clean_name = str(file_name or "").strip()
+        if not clean_name:
+            continue
+        if skip_existing and clean_name in merged:
+            continue
+        vec = _normalize_embedding_vector_np(vector)
+        if vec is None:
+            continue
+        if clean_name in merged:
+            updated += 1
+        else:
+            added += 1
+        merged[clean_name] = vec
+
+    if added > 0 or updated > 0 or (existing_embeddings is not None and not os.path.exists(os.path.abspath(store_path))):
+        save_clustering_embeddings_store(store_path, merged)
+
+    return merged, added, updated
+
+
+def _embeddings_tensor_to_filename_vectors(embeddings, valid_wav_files):
+    if embeddings is None or not valid_wav_files:
+        return {}
+
+    vectors = {}
+    try:
+        emb_np = embeddings.detach().cpu().numpy().astype(np.float32)
+    except Exception:
+        return {}
+
+    for idx, wav_path in enumerate(valid_wav_files):
+        if idx >= emb_np.shape[0]:
+            break
+        file_name = os.path.basename(str(wav_path))
+        if not file_name:
+            continue
+        vec = _normalize_embedding_vector_np(emb_np[idx])
+        if vec is None:
+            continue
+        vectors[file_name] = vec
+    return vectors
+
+
+def sync_clustering_embeddings_store_for_manifest(
+    manifest_path,
+    destination_folder,
+    cache_dir="./model_cache",
+    max_audio_length=10.0,
+    min_duration=0.5,
+    max_duration=10.0,
+    target_sr=16000,
+    use_half=False,
+    audio_workers=None,
+    embedding_batch_size=32,
+    prefer_process_pool=True,
+    manifest_scan_workers=None,
+):
+    manifest_path = os.path.abspath(manifest_path)
+    destination_folder = os.path.abspath(destination_folder)
+    store_path = clustering_embeddings_store_path_from_manifest(manifest_path)
+
+    embeddings_by_filename = load_clustering_embeddings_store(store_path)
+    assignments = _collect_cluster_assignments(
+        destination_folder=destination_folder,
+        include_set=None,
+        manifest_scan_workers=manifest_scan_workers,
+        prefer_process_pool=True,
+    )
+
+    file_to_path = {}
+    for file_name, (cluster_name, _mtime) in assignments.items():
+        candidate = os.path.join(destination_folder, cluster_name, file_name)
+        if os.path.isfile(candidate):
+            file_to_path[file_name] = candidate
+
+    expected_files = len(file_to_path)
+    missing_names = [name for name in sorted(file_to_path.keys()) if name not in embeddings_by_filename]
+    missing_set = set(missing_names)
+    added_embeddings = 0
+
+    if missing_names:
+        missing_paths = [file_to_path[name] for name in missing_names]
+        embeddings, valid_wav_files, _noise_files, _timing = compute_embeddings_for_files(
+            wav_files=missing_paths,
+            max_audio_length=max_audio_length,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            cache_dir=cache_dir,
+            target_sr=target_sr,
+            use_half=use_half,
+            audio_workers=audio_workers,
+            embedding_batch_size=embedding_batch_size,
+            prefer_process_pool=prefer_process_pool,
+        )
+
+        computed_vectors = _embeddings_tensor_to_filename_vectors(embeddings, valid_wav_files)
+        if computed_vectors:
+            filtered_vectors = {name: vec for name, vec in computed_vectors.items() if name in missing_set}
+            embeddings_by_filename, added_embeddings, _updated = upsert_clustering_embeddings_store(
+                store_path=store_path,
+                new_embeddings_by_filename=filtered_vectors,
+                existing_embeddings=embeddings_by_filename,
+                skip_existing=True,
+            )
+    elif not os.path.exists(store_path):
+        # Create an empty store once so downstream code has a stable location.
+        save_clustering_embeddings_store(store_path, embeddings_by_filename)
+
+    available_files = sum(1 for name in file_to_path if name in embeddings_by_filename)
+    missing_after = max(0, expected_files - available_files)
+
+    print(
+        "[INFO] Synced local embeddings store: "
+        f"{store_path} (expected_files={expected_files}, available={available_files}, "
+        f"added={added_embeddings}, missing_after={missing_after})."
+    )
+    return store_path, expected_files, available_files, added_embeddings, missing_after
+
+
 def _auto_audio_workers():
     cpu_count = os.cpu_count() or 4
     return max(2, min(8, cpu_count // 2))
@@ -335,8 +566,8 @@ def chunked_cosine_similarity(embeddings, device, chunk_size=512, use_half=False
     return sim_mat
 
 
-def compute_embeddings(
-    directory,
+def _compute_embeddings_from_wav_files(
+    all_wav_files,
     max_audio_length=10.0,
     min_duration=0.5,
     max_duration=10.0,
@@ -347,21 +578,14 @@ def compute_embeddings(
     embedding_batch_size=32,
     prefer_process_pool=True,
 ):
-    """
-    Load WAV files, filter by duration, compute embeddings using ReDimNet.
-    Returns normalized embeddings and valid file paths.
-    """
     total_start = time.perf_counter()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}.")
 
     os.makedirs(cache_dir, exist_ok=True)
     torch.hub.set_dir(cache_dir)
-
-    all_wav_files = sorted(glob.glob(os.path.join(directory, "*.wav")))
-    print(f"[INFO] Found {len(all_wav_files)} WAV files in directory: {directory}.")
     if not all_wav_files:
-        return None, [], [], {"total_s": 0.0}
+        return None, [], [], {"total_s": 0.0, "prepare_audio_s": 0.0, "embedding_s": 0.0}
 
     max_samples = int(max_audio_length * target_sr)
     audio_workers = _safe_int(audio_workers, _auto_audio_workers())
@@ -493,6 +717,83 @@ def compute_embeddings(
     # noise_files kept for backward compatibility of downstream API.
     noise_files = []
     return embeddings, valid_wav_files, noise_files, timing
+
+
+def compute_embeddings(
+    directory,
+    max_audio_length=10.0,
+    min_duration=0.5,
+    max_duration=10.0,
+    cache_dir="./model_cache",
+    target_sr=16000,
+    use_half=False,
+    audio_workers=None,
+    embedding_batch_size=32,
+    prefer_process_pool=True,
+):
+    """
+    Load WAV files from a directory, filter by duration, compute embeddings using ReDimNet.
+    Returns normalized embeddings and valid file paths.
+    """
+    all_wav_files = sorted(glob.glob(os.path.join(directory, "*.wav")))
+    print(f"[INFO] Found {len(all_wav_files)} WAV files in directory: {directory}.")
+    return _compute_embeddings_from_wav_files(
+        all_wav_files=all_wav_files,
+        max_audio_length=max_audio_length,
+        min_duration=min_duration,
+        max_duration=max_duration,
+        cache_dir=cache_dir,
+        target_sr=target_sr,
+        use_half=use_half,
+        audio_workers=audio_workers,
+        embedding_batch_size=embedding_batch_size,
+        prefer_process_pool=prefer_process_pool,
+    )
+
+
+def compute_embeddings_for_files(
+    wav_files,
+    max_audio_length=10.0,
+    min_duration=0.5,
+    max_duration=10.0,
+    cache_dir="./model_cache",
+    target_sr=16000,
+    use_half=False,
+    audio_workers=None,
+    embedding_batch_size=32,
+    prefer_process_pool=True,
+):
+    """
+    Compute embeddings for an explicit WAV path list.
+    Returns normalized embeddings and valid file paths.
+    """
+    seen = set()
+    all_wav_files = []
+    for path in wav_files or []:
+        abs_path = os.path.abspath(str(path))
+        if abs_path in seen:
+            continue
+        if not abs_path.lower().endswith(".wav"):
+            continue
+        if not os.path.isfile(abs_path):
+            continue
+        all_wav_files.append(abs_path)
+        seen.add(abs_path)
+
+    all_wav_files.sort()
+    print(f"[INFO] Found {len(all_wav_files)} WAV files in explicit input list.")
+    return _compute_embeddings_from_wav_files(
+        all_wav_files=all_wav_files,
+        max_audio_length=max_audio_length,
+        min_duration=min_duration,
+        max_duration=max_duration,
+        cache_dir=cache_dir,
+        target_sr=target_sr,
+        use_half=use_half,
+        audio_workers=audio_workers,
+        embedding_batch_size=embedding_batch_size,
+        prefer_process_pool=prefer_process_pool,
+    )
 
 
 def compute_embeddings_and_distance(
@@ -952,6 +1253,19 @@ def clustering_for_main(
                 included_filenames=[],
             )
             return
+
+        embedding_store_path = clustering_embeddings_store_path_from_wav_folder(wav_folder)
+        embedding_vectors = _embeddings_tensor_to_filename_vectors(embeddings, valid_wav_files)
+        _, added_embeddings, _updated_embeddings = upsert_clustering_embeddings_store(
+            store_path=embedding_store_path,
+            new_embeddings_by_filename=embedding_vectors,
+            existing_embeddings=None,
+            skip_existing=True,
+        )
+        print(
+            "[INFO] Synced local embeddings after clustering run: "
+            f"{embedding_store_path} (batch_files={len(embedding_vectors)}, added={added_embeddings})."
+        )
 
         print("[INFO] Performing HDBSCAN + K-Means clustering.")
         hdbscan_kmeans_clustering(

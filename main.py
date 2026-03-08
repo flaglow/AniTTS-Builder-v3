@@ -7,8 +7,19 @@ from module.tools import (
 )
 from module.whisper import process_audio_files
 from module.msst import msst_for_main
-from module.clustering import clustering_for_main, refresh_clustering_manifest_cluster_dirs
+from module.clustering import (
+    clustering_for_main,
+    refresh_clustering_manifest_cluster_dirs,
+    sync_clustering_embeddings_store_for_manifest,
+)
 from module.ass_slice import run_ass_slice
+from module.labeling import (
+    apply_cluster_label,
+    build_labeling_context,
+    get_label_choices,
+    recommend_label_for_cluster,
+    validate_label_name,
+)
 import os
 import time
 import gradio as gr
@@ -254,20 +265,34 @@ def stage_clustering(wav_folder, result_folder, embeddings_cache_dir, pipeline_n
         raise
 
 
-def stage_refresh_cluster_dirs(manifest_path, result_folder):
+def stage_refresh_cluster_dirs(manifest_path, result_folder, embeddings_cache_dir):
     stage_name = "Utility#1 Refresh cluster_dir"
     input_count = _count_wavs_recursive(result_folder)
     started_at = time.perf_counter()
     _stage_log_start(
         stage_name,
         input_files=input_count,
-        extra=f"manifest_path={manifest_path} result_folder={result_folder}",
+        extra=(
+            f"manifest_path={manifest_path} result_folder={result_folder} "
+            f"embeddings_cache_dir={embeddings_cache_dir}"
+        ),
     )
     try:
         manifest_path, rows_count, changed_rows, added_rows, missing_rows = refresh_clustering_manifest_cluster_dirs(
             manifest_path=manifest_path,
             destination_folder=result_folder,
             append_missing_rows=True,
+        )
+        (
+            embedding_store_path,
+            embedding_expected_files,
+            embedding_available_files,
+            embedding_added_files,
+            embedding_missing_after,
+        ) = sync_clustering_embeddings_store_for_manifest(
+            manifest_path=manifest_path,
+            destination_folder=result_folder,
+            cache_dir=embeddings_cache_dir,
         )
         _stage_log_done(
             stage_name,
@@ -276,12 +301,608 @@ def stage_refresh_cluster_dirs(manifest_path, result_folder):
             output_files=rows_count,
             extra=(
                 f"manifest_path={manifest_path} changed_rows={changed_rows} "
-                f"added_rows={added_rows} missing_rows={missing_rows}"
+                f"added_rows={added_rows} missing_rows={missing_rows} "
+                f"embedding_store_path={embedding_store_path} "
+                f"embedding_expected_files={embedding_expected_files} "
+                f"embedding_available_files={embedding_available_files} "
+                f"embedding_added_files={embedding_added_files} "
+                f"embedding_missing_after={embedding_missing_after}"
             ),
         )
     except Exception as exc:
         _stage_log_fail(stage_name, started_at, input_files=input_count, error=exc)
         raise
+
+
+def _labeling_safe_cache(cache):
+    if isinstance(cache, dict) and isinstance(cache.get("clusters"), dict):
+        return cache
+    return {"clusters": {}}
+
+
+def _labeling_format_sample(sample):
+    if not sample:
+        return "샘플 없음"
+
+    transcript = sample.get("transcript") or "(전사 없음)"
+    audio_path = sample.get("audio_path") or ""
+    audio_note = "" if (audio_path and os.path.exists(audio_path)) else "\n오디오: 없음"
+    return (
+        f"클러스터: `{sample.get('cluster_name', '')}`\n"
+        f"파일: `{sample.get('filename', '')}`\n"
+        f"구간: {sample.get('timestamp_start', '')} ~ {sample.get('timestamp_end', '')} "
+        f"({float(sample.get('duration', 0.0)):.2f}s)\n"
+        f"대사: {transcript}"
+        f"{audio_note}"
+    )
+
+
+def _labeling_sample_updates(samples, limit):
+    updates = []
+    safe_samples = list(samples or [])
+    for idx in range(limit):
+        if idx < len(safe_samples):
+            sample = safe_samples[idx] or {}
+            audio_path = sample.get("audio_path") or ""
+            audio_value = audio_path if audio_path and os.path.exists(audio_path) else None
+            updates.extend([gr.update(value=_labeling_format_sample(sample)), gr.update(value=audio_value)])
+        else:
+            updates.extend([gr.update(value="샘플 없음"), gr.update(value=None)])
+    return updates
+
+
+def _labeling_normalize_pending(pending_decisions):
+    if not isinstance(pending_decisions, list):
+        return []
+
+    normalized = []
+    seen = set()
+    for item in pending_decisions:
+        if not isinstance(item, dict):
+            continue
+        source_cluster = str(item.get("source_cluster") or "").strip()
+        target_label = str(item.get("target_label") or "").strip()
+        if not source_cluster or not target_label or source_cluster in seen:
+            continue
+        normalized.append({"source_cluster": source_cluster, "target_label": target_label})
+        seen.add(source_cluster)
+    return normalized
+
+
+def _labeling_pending_upsert(pending_decisions, source_cluster, target_label):
+    source_cluster = str(source_cluster or "").strip()
+    target_label = str(target_label or "").strip()
+    pending = _labeling_normalize_pending(pending_decisions)
+    if not source_cluster or not target_label:
+        return pending
+
+    replaced = False
+    for item in pending:
+        if item["source_cluster"] == source_cluster:
+            item["target_label"] = target_label
+            replaced = True
+            break
+    if not replaced:
+        pending.append({"source_cluster": source_cluster, "target_label": target_label})
+    return pending
+
+
+def _labeling_pending_remove(pending_decisions, source_cluster):
+    source_cluster = str(source_cluster or "").strip()
+    pending = _labeling_normalize_pending(pending_decisions)
+    if not source_cluster:
+        return pending
+    return [item for item in pending if item["source_cluster"] != source_cluster]
+
+
+def _labeling_build_progress(context, skipped_clusters, pending_decisions):
+    if not context:
+        return "진행상황: -"
+
+    unlabeled = list(context.get("unlabeled_clusters", []))
+    skipped = {str(x).strip() for x in (skipped_clusters or []) if str(x).strip()}
+    pending = _labeling_normalize_pending(pending_decisions)
+    pending_sources = {item["source_cluster"] for item in pending}
+
+    skipped_active = [c for c in unlabeled if c in skipped]
+    pending_active = [c for c in unlabeled if c in pending_sources]
+    remaining = [c for c in unlabeled if c not in skipped and c not in pending_sources]
+    return (
+        f"진행상황: 미라벨 {len(unlabeled)}개 / "
+        f"남은 후보 {len(remaining)}개 / "
+        f"건너뜀 {len(skipped_active)}개 / "
+        f"확정 대기 {len(pending_active)}개"
+    )
+
+
+def _labeling_pick_and_recommend(
+    context,
+    cache,
+    current_cluster,
+    skipped_clusters,
+    embeddings_cache_dir,
+    prefer_current,
+    exclude_clusters=None,
+):
+    if not context:
+        return "", None, cache, 0
+
+    skipped = {str(x).strip() for x in (skipped_clusters or []) if str(x).strip()}
+    excluded = {str(x).strip() for x in (exclude_clusters or []) if str(x).strip()}
+    unlabeled = [c for c in context.get("unlabeled_clusters", []) if context.get("unlabeled_sizes", {}).get(c, 0) > 0]
+
+    def _is_candidate(cluster_name):
+        return cluster_name not in skipped and cluster_name not in excluded
+
+    candidates = [c for c in unlabeled if _is_candidate(c)]
+    target_cluster = ""
+
+    if (
+        prefer_current
+        and current_cluster
+        and current_cluster in unlabeled
+        and _is_candidate(current_cluster)
+    ):
+        target_cluster = current_cluster
+    elif candidates:
+        target_cluster = candidates[0]
+
+    if not target_cluster:
+        return "", None, cache, 0
+
+    recommendation, cache = recommend_label_for_cluster(
+        context=context,
+        target_cluster=target_cluster,
+        embedding_cache=cache,
+        embeddings_cache_dir=embeddings_cache_dir,
+        top_k=3,
+        centroid_top_n=8,
+        low_score_threshold=0.35,
+        low_gap_threshold=0.03,
+    )
+    return target_cluster, recommendation, cache, len(candidates)
+
+
+def labeling_action_auto(
+    manifest_path,
+    result_folder,
+    embeddings_cache_dir,
+    context,
+    cache,
+    current_cluster,
+    skipped_clusters,
+    pending_decisions,
+):
+    try:
+        cache = _labeling_safe_cache(cache)
+        pending = _labeling_normalize_pending(pending_decisions)
+        context = build_labeling_context(manifest_path, result_folder)
+        pending_sources = {item["source_cluster"] for item in pending}
+        target_cluster, recommendation, cache, remaining = _labeling_pick_and_recommend(
+            context=context,
+            cache=cache,
+            current_cluster=current_cluster,
+            skipped_clusters=skipped_clusters,
+            embeddings_cache_dir=embeddings_cache_dir,
+            prefer_current=bool(current_cluster),
+            exclude_clusters=pending_sources,
+        )
+        review_state = "unreviewed"
+        if not target_cluster:
+            status = f"모든 미라벨 클러스터 검토가 완료됐습니다. (확정 대기 {len(pending)}건)"
+        elif recommendation and recommendation.get("recommended_label"):
+            status = (
+                f"`{target_cluster}` 추천 완료: `{recommendation['recommended_label']}` "
+                f"(score={recommendation.get('recommended_score', 0.0):.4f}, remaining={remaining}, pending={len(pending)})"
+            )
+        else:
+            reason = recommendation.get("confidence_reason", "") if recommendation else ""
+            status = f"`{target_cluster}` 자동 추천 생성 실패. {reason}".strip()
+        return context, cache, target_cluster, recommendation, review_state, skipped_clusters, pending, status
+    except Exception as exc:
+        return (
+            context,
+            cache,
+            current_cluster,
+            None,
+            "unreviewed",
+            skipped_clusters,
+            _labeling_normalize_pending(pending_decisions),
+            f"자동 라벨 실패: {exc}",
+        )
+
+
+def labeling_action_next(
+    manifest_path,
+    result_folder,
+    embeddings_cache_dir,
+    context,
+    cache,
+    current_cluster,
+    skipped_clusters,
+    pending_decisions,
+):
+    try:
+        cache = _labeling_safe_cache(cache)
+        pending = _labeling_normalize_pending(pending_decisions)
+        skipped = {str(x).strip() for x in (skipped_clusters or []) if str(x).strip()}
+        if current_cluster:
+            skipped.add(current_cluster)
+        skipped_sorted = sorted(skipped)
+
+        context = build_labeling_context(manifest_path, result_folder)
+        pending_sources = {item["source_cluster"] for item in pending}
+        target_cluster, recommendation, cache, remaining = _labeling_pick_and_recommend(
+            context=context,
+            cache=cache,
+            current_cluster="",
+            skipped_clusters=skipped_sorted,
+            embeddings_cache_dir=embeddings_cache_dir,
+            prefer_current=False,
+            exclude_clusters=pending_sources,
+        )
+        review_state = "unreviewed"
+        if not target_cluster:
+            status = f"다음 후보가 없습니다. (확정 대기 {len(pending)}건)"
+        else:
+            status = f"다음 클러스터로 이동: `{target_cluster}` (remaining={remaining}, pending={len(pending)})"
+        return context, cache, target_cluster, recommendation, review_state, skipped_sorted, pending, status
+    except Exception as exc:
+        return (
+            context,
+            cache,
+            current_cluster,
+            None,
+            "unreviewed",
+            skipped_clusters,
+            _labeling_normalize_pending(pending_decisions),
+            f"다음 클러스터 이동 실패: {exc}",
+        )
+
+
+def labeling_action_skip(
+    manifest_path,
+    result_folder,
+    embeddings_cache_dir,
+    context,
+    cache,
+    current_cluster,
+    skipped_clusters,
+    pending_decisions,
+):
+    context, cache, target_cluster, recommendation, review_state, skipped_sorted, pending, status = labeling_action_next(
+        manifest_path,
+        result_folder,
+        embeddings_cache_dir,
+        context,
+        cache,
+        current_cluster,
+        skipped_clusters,
+        pending_decisions,
+    )
+    if target_cluster:
+        status = f"현재 클러스터를 건너뛰고 `{target_cluster}`로 이동했습니다. (pending={len(pending)})"
+    return context, cache, target_cluster, recommendation, review_state, skipped_sorted, pending, status
+
+
+def labeling_action_refresh(
+    manifest_path,
+    result_folder,
+    embeddings_cache_dir,
+    context,
+    cache,
+    current_cluster,
+    skipped_clusters,
+    pending_decisions,
+):
+    try:
+        pending = _labeling_normalize_pending(pending_decisions)
+        _manifest, rows_count, changed_rows, added_rows, missing_rows = refresh_clustering_manifest_cluster_dirs(
+            manifest_path=manifest_path,
+            destination_folder=result_folder,
+            append_missing_rows=True,
+        )
+        (
+            embedding_store_path,
+            embedding_expected_files,
+            embedding_available_files,
+            embedding_added_files,
+            embedding_missing_after,
+        ) = sync_clustering_embeddings_store_for_manifest(
+            manifest_path=manifest_path,
+            destination_folder=result_folder,
+            cache_dir=embeddings_cache_dir,
+        )
+        context = build_labeling_context(manifest_path, result_folder)
+        cache = {"clusters": {}}
+        pending_sources = {item["source_cluster"] for item in pending}
+        target_cluster, recommendation, cache, remaining = _labeling_pick_and_recommend(
+            context=context,
+            cache=cache,
+            current_cluster=current_cluster,
+            skipped_clusters=skipped_clusters,
+            embeddings_cache_dir=embeddings_cache_dir,
+            prefer_current=True,
+            exclude_clusters=pending_sources,
+        )
+        if target_cluster:
+            status = (
+                "Refresh 완료: "
+                f"rows={rows_count}, changed={changed_rows}, added={added_rows}, missing={missing_rows}. "
+                f"embedding_available={embedding_available_files}/{embedding_expected_files}, "
+                f"embedding_added={embedding_added_files}, embedding_missing_after={embedding_missing_after}. "
+                f"현재 대상 `{target_cluster}` (remaining={remaining}, pending={len(pending)})"
+            )
+        else:
+            status = (
+                "Refresh 완료: "
+                f"rows={rows_count}, changed={changed_rows}, added={added_rows}, missing={missing_rows}. "
+                f"embedding_store={embedding_store_path}, "
+                f"embedding_available={embedding_available_files}/{embedding_expected_files}, "
+                f"embedding_added={embedding_added_files}, embedding_missing_after={embedding_missing_after}. "
+                f"남은 미라벨 클러스터가 없습니다. (pending={len(pending)})"
+            )
+        return context, cache, target_cluster, recommendation, "unreviewed", skipped_clusters, pending, status
+    except Exception as exc:
+        return (
+            context,
+            cache,
+            current_cluster,
+            None,
+            "unreviewed",
+            skipped_clusters,
+            _labeling_normalize_pending(pending_decisions),
+            f"Refresh 실패: {exc}",
+        )
+
+
+def labeling_action_accept(
+    manifest_path,
+    result_folder,
+    embeddings_cache_dir,
+    context,
+    cache,
+    current_cluster,
+    recommendation,
+    review_state,
+    skipped_clusters,
+    pending_decisions,
+    status_text,
+):
+    _ = review_state, status_text
+    cache = _labeling_safe_cache(cache)
+    pending = _labeling_normalize_pending(pending_decisions)
+    if not recommendation or not recommendation.get("recommended_label") or not current_cluster:
+        status = "추천 결과가 없어 O를 적용할 수 없습니다."
+        return context, cache, current_cluster, recommendation, "unreviewed", skipped_clusters, pending, status
+
+    label = recommendation["recommended_label"]
+    pending = _labeling_pending_upsert(pending, current_cluster, label)
+
+    if not context:
+        context = build_labeling_context(manifest_path, result_folder)
+
+    pending_sources = {item["source_cluster"] for item in pending}
+    target_cluster, next_recommendation, cache, remaining = _labeling_pick_and_recommend(
+        context=context,
+        cache=cache,
+        current_cluster="",
+        skipped_clusters=skipped_clusters,
+        embeddings_cache_dir=embeddings_cache_dir,
+        prefer_current=False,
+        exclude_clusters=pending_sources,
+    )
+
+    if target_cluster:
+        status = (
+            f"O 저장: `{current_cluster}` -> `{label}` (확정 대기 {len(pending)}건). "
+            f"다음 대상 `{target_cluster}` (remaining={remaining})"
+        )
+    else:
+        status = (
+            f"O 저장: `{current_cluster}` -> `{label}` (확정 대기 {len(pending)}건). "
+            "남은 후보가 없습니다. `확정`으로 일괄 반영하세요."
+        )
+    return context, cache, target_cluster, next_recommendation, "unreviewed", skipped_clusters, pending, status
+
+
+def labeling_action_reject(
+    context,
+    cache,
+    current_cluster,
+    recommendation,
+    review_state,
+    skipped_clusters,
+    pending_decisions,
+    status_text,
+):
+    _ = review_state, status_text
+    cache = _labeling_safe_cache(cache)
+    pending = _labeling_pending_remove(pending_decisions, current_cluster)
+    status = "X 선택됨: 기존 라벨 선택 또는 새 라벨 입력 후 `확정`을 눌러 주세요."
+    return context, cache, current_cluster, recommendation, "rejected", skipped_clusters, pending, status
+
+
+def labeling_action_confirm(
+    manifest_path,
+    result_folder,
+    embeddings_cache_dir,
+    context,
+    cache,
+    current_cluster,
+    recommendation,
+    review_state,
+    selected_label,
+    new_label,
+    skipped_clusters,
+    pending_decisions,
+):
+    try:
+        pending = _labeling_normalize_pending(pending_decisions)
+
+        manual_label = ""
+        if str(new_label or "").strip():
+            manual_label = str(new_label).strip()
+        elif str(selected_label or "").strip():
+            manual_label = str(selected_label).strip()
+
+        if review_state == "accepted" and recommendation and recommendation.get("recommended_label") and current_cluster:
+            pending = _labeling_pending_upsert(pending, current_cluster, recommendation["recommended_label"])
+        elif manual_label and current_cluster:
+            pending = _labeling_pending_upsert(pending, current_cluster, manual_label)
+
+        if not pending:
+            raise ValueError("확정할 항목이 없습니다. O 선택 또는 수동 라벨 지정이 필요합니다.")
+
+        move_results = []
+        for item in pending:
+            ok, normalized_label, error_message = validate_label_name(item["target_label"])
+            if not ok:
+                raise ValueError(f"{item['source_cluster']} -> {item['target_label']}: {error_message}")
+            move_result = apply_cluster_label(
+                result_folder=result_folder,
+                source_cluster=item["source_cluster"],
+                target_label=normalized_label,
+            )
+            move_results.append(move_result)
+
+        _manifest, rows_count, changed_rows, added_rows, missing_rows = refresh_clustering_manifest_cluster_dirs(
+            manifest_path=manifest_path,
+            destination_folder=result_folder,
+            append_missing_rows=True,
+        )
+        (
+            _embedding_store_path,
+            embedding_expected_files,
+            embedding_available_files,
+            embedding_added_files,
+            embedding_missing_after,
+        ) = sync_clustering_embeddings_store_for_manifest(
+            manifest_path=manifest_path,
+            destination_folder=result_folder,
+            cache_dir=embeddings_cache_dir,
+        )
+
+        context = build_labeling_context(manifest_path, result_folder)
+        cache = {"clusters": {}}
+        applied_sources = {item["source_cluster"] for item in move_results}
+
+        skipped = {str(x).strip() for x in (skipped_clusters or []) if str(x).strip()}
+        skipped = {x for x in skipped if x and x not in applied_sources}
+        skipped_sorted = sorted(skipped)
+
+        target_cluster, recommendation, cache, remaining = _labeling_pick_and_recommend(
+            context=context,
+            cache=cache,
+            current_cluster="",
+            skipped_clusters=skipped_sorted,
+            embeddings_cache_dir=embeddings_cache_dir,
+            prefer_current=False,
+            exclude_clusters=set(),
+        )
+
+        moved_total = sum(int(item.get("moved_files", 0)) for item in move_results)
+        overwritten_total = sum(int(item.get("overwritten_files", 0)) for item in move_results)
+
+        if target_cluster:
+            status = (
+                f"라벨 확정 완료: clusters={len(move_results)}, moved={moved_total}, overwritten={overwritten_total}. "
+                f"Refresh rows={rows_count}, changed={changed_rows}, added={added_rows}, missing={missing_rows}. "
+                f"embedding_available={embedding_available_files}/{embedding_expected_files}, "
+                f"embedding_added={embedding_added_files}, embedding_missing_after={embedding_missing_after}. "
+                f"다음 대상 `{target_cluster}` (remaining={remaining})"
+            )
+        else:
+            status = (
+                f"라벨 확정 완료: clusters={len(move_results)}, moved={moved_total}, overwritten={overwritten_total}. "
+                f"Refresh rows={rows_count}, changed={changed_rows}, added={added_rows}, missing={missing_rows}. "
+                f"embedding_available={embedding_available_files}/{embedding_expected_files}, "
+                f"embedding_added={embedding_added_files}, embedding_missing_after={embedding_missing_after}. "
+                "남은 미라벨 클러스터가 없습니다."
+            )
+
+        return context, cache, target_cluster, recommendation, "unreviewed", skipped_sorted, [], status
+    except Exception as exc:
+        return (
+            context,
+            cache,
+            current_cluster,
+            recommendation,
+            review_state,
+            skipped_clusters,
+            _labeling_normalize_pending(pending_decisions),
+            f"라벨 확정 실패: {exc}",
+        )
+
+
+def labeling_render(context, current_cluster, recommendation, review_state, status_text, skipped_clusters, pending_decisions):
+    pending = _labeling_normalize_pending(pending_decisions)
+    pending_map = {item["source_cluster"]: item["target_label"] for item in pending}
+    status_value = status_text or "라벨링 준비 완료. `자동 라벨`을 눌러 시작하세요."
+    progress_value = _labeling_build_progress(context, skipped_clusters, pending)
+
+    target_title = "현재 대상 클러스터: -"
+    rec_title = "추천 라벨: -"
+    rec_candidates = "상위 후보: -"
+    rec_warning = "신뢰도: -"
+    decision_value = "판단 상태: 미선택"
+
+    if recommendation:
+        target_cluster = recommendation.get("target_cluster") or ""
+        if target_cluster:
+            target_title = f"현재 대상 클러스터: `{target_cluster}`"
+
+        recommended_label = recommendation.get("recommended_label") or ""
+        recommended_score = recommendation.get("recommended_score")
+        if recommended_label and recommended_score is not None:
+            rec_title = f"추천 라벨: `{recommended_label}` (평균 유사도 {float(recommended_score):.4f})"
+
+        candidates = recommendation.get("candidate_scores") or []
+        if candidates:
+            lines = []
+            for idx, item in enumerate(candidates, start=1):
+                lines.append(f"{idx}. `{item.get('label', '')}` ({float(item.get('score', 0.0)):.4f})")
+            rec_candidates = "상위 후보:\n" + "\n".join(lines)
+
+        if recommendation.get("confidence_warning"):
+            reason = recommendation.get("confidence_reason") or "임계값 미달"
+            rec_warning = f"[경고] 추천 신뢰도 낮음: {reason}"
+        elif recommended_label:
+            rec_warning = "신뢰도: 기준 통과"
+
+        if current_cluster and current_cluster in pending_map:
+            decision_value = f"판단 상태: 확정 대기 (`{pending_map[current_cluster]}`)"
+        elif review_state == "rejected":
+            decision_value = "판단 상태: X (수동 라벨 지정 필요)"
+        elif review_state == "accepted" and recommended_label:
+            decision_value = f"판단 상태: O (추천 라벨 `{recommended_label}` 적용 대기)"
+
+    label_choices = get_label_choices(context, exclude_noise=True) if context else []
+    dropdown_value = None
+    if current_cluster and current_cluster in pending_map and pending_map[current_cluster] in label_choices:
+        dropdown_value = pending_map[current_cluster]
+    elif (
+        review_state == "accepted"
+        and recommendation
+        and recommendation.get("recommended_label") in label_choices
+    ):
+        dropdown_value = recommendation.get("recommended_label")
+
+    dropdown_update = gr.update(choices=label_choices, value=dropdown_value)
+    rec_sample_updates = _labeling_sample_updates(
+        recommendation.get("recommended_samples", []) if recommendation else [],
+        limit=3,
+    )
+    target_sample_updates = _labeling_sample_updates(
+        recommendation.get("target_samples", []) if recommendation else [],
+        limit=5,
+    )
+
+    return (
+        [status_value, progress_value, target_title, rec_title, rec_candidates, rec_warning, decision_value, dropdown_update]
+        + rec_sample_updates
+        + target_sample_updates
+    )
 
 with gr.Blocks() as demo:
     gr.Markdown("## AniTTS Builder-v3")
@@ -298,6 +919,14 @@ with gr.Blocks() as demo:
     embeddings_cache_dir = gr.Textbox(value="./module/model/redimmet", interactive=False, visible=False)
     refresh_manifest_path = gr.Textbox(value="./data_mydata/clustering_slices.csv", interactive=False, visible=False)
     refresh_result_folder = gr.Textbox(value="./data_mydata/result", interactive=False, visible=False)
+    labeling_context_state = gr.State(value=None)
+    labeling_embedding_cache_state = gr.State(value={"clusters": {}})
+    labeling_current_cluster_state = gr.State(value="")
+    labeling_recommendation_state = gr.State(value=None)
+    labeling_review_state = gr.State(value="unreviewed")
+    labeling_skipped_state = gr.State(value=[])
+    labeling_pending_state = gr.State(value=[])
+    labeling_status_state = gr.State(value="라벨링 준비 완료. `자동 라벨`을 눌러 시작하세요.")
     # 버튼 활성화 상태 저장용 state 추가
     button_state = gr.State(value=True)
 
@@ -369,6 +998,78 @@ with gr.Blocks() as demo:
             )
             btn_ws_clustering = gr.Button("5. 화자 임베딩 & 클러스터링 실행 (Run Embeddings & Clustering)")
 
+        with gr.Tab("3) 라벨링"):
+            gr.Markdown(
+                "### 라벨링 탭\n"
+                "`./data_mydata/clustering_slices.csv`를 기반으로 미라벨 클러스터(`clustering_숫자`)를 "
+                "자동 추천 + O/X 검수로 확정합니다."
+            )
+
+            with gr.Row():
+                btn_labeling_auto = gr.Button("자동 라벨")
+                btn_labeling_next = gr.Button("다음 클러스터")
+                btn_labeling_refresh = gr.Button("Refresh cluster_dir")
+
+            labeling_status_md = gr.Markdown("라벨링 준비 완료. `자동 라벨`을 눌러 시작하세요.")
+            labeling_progress_md = gr.Markdown("진행상황: -")
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    labeling_target_title_md = gr.Markdown("현재 대상 클러스터: -")
+                    labeling_recommend_title_md = gr.Markdown("추천 라벨: -")
+                    labeling_candidates_md = gr.Markdown("상위 후보: -")
+                    labeling_warning_md = gr.Markdown("신뢰도: -")
+
+                    gr.Markdown("#### 추천 라벨 샘플 3개")
+                    rec_sample_mds = []
+                    rec_sample_audios = []
+                    for idx in range(3):
+                        rec_sample_mds.append(gr.Markdown(f"추천 샘플 {idx + 1}: 샘플 없음"))
+                        rec_sample_audios.append(
+                            gr.Audio(
+                                label=f"추천 샘플 {idx + 1} 재생",
+                                type="filepath",
+                                interactive=False,
+                                value=None,
+                            )
+                        )
+
+                with gr.Column(scale=1):
+                    gr.Markdown("#### 현재 미라벨 클러스터 샘플 5개")
+                    target_sample_mds = []
+                    target_sample_audios = []
+                    for idx in range(5):
+                        target_sample_mds.append(gr.Markdown(f"대상 샘플 {idx + 1}: 샘플 없음"))
+                        target_sample_audios.append(
+                            gr.Audio(
+                                label=f"대상 샘플 {idx + 1} 재생",
+                                type="filepath",
+                                interactive=False,
+                                value=None,
+                            )
+                        )
+
+            with gr.Row():
+                btn_labeling_accept = gr.Button("O (유사함)")
+                btn_labeling_reject = gr.Button("X (다름)")
+                btn_labeling_skip = gr.Button("건너뛰기")
+
+            labeling_decision_md = gr.Markdown("판단 상태: 미선택")
+
+            with gr.Row():
+                labeling_existing_label = gr.Dropdown(
+                    label="기존 라벨 선택",
+                    choices=[],
+                    value=None,
+                    allow_custom_value=False,
+                )
+                labeling_new_label = gr.Textbox(
+                    label="새 라벨 생성",
+                    placeholder="예: 오카베 린타로",
+                    value="",
+                )
+            btn_labeling_confirm = gr.Button("확정")
+
     gr.Markdown(
         "### 유틸리티\n"
         "`./data_mydata/clustering_slices.csv`의 `cluster_dir`를 현재 `./data_mydata/result` 구조로 최신화합니다."
@@ -389,7 +1090,39 @@ with gr.Blocks() as demo:
         btn_ws_ass_slice,
         btn_ws_clustering,
         btn_refresh_cluster_dirs,
+        btn_labeling_auto,
+        btn_labeling_next,
+        btn_labeling_refresh,
+        btn_labeling_accept,
+        btn_labeling_reject,
+        btn_labeling_confirm,
+        btn_labeling_skip,
     ]
+
+    labeling_state_outputs = [
+        labeling_context_state,
+        labeling_embedding_cache_state,
+        labeling_current_cluster_state,
+        labeling_recommendation_state,
+        labeling_review_state,
+        labeling_skipped_state,
+        labeling_pending_state,
+        labeling_status_state,
+    ]
+    labeling_render_outputs = [
+        labeling_status_md,
+        labeling_progress_md,
+        labeling_target_title_md,
+        labeling_recommend_title_md,
+        labeling_candidates_md,
+        labeling_warning_md,
+        labeling_decision_md,
+        labeling_existing_label,
+    ]
+    for md_comp, audio_comp in zip(rec_sample_mds, rec_sample_audios):
+        labeling_render_outputs.extend([md_comp, audio_comp])
+    for md_comp, audio_comp in zip(target_sample_mds, target_sample_audios):
+        labeling_render_outputs.extend([md_comp, audio_comp])
 
     # 모든 버튼 비활성화 함수
     def disable_all():
@@ -463,9 +1196,241 @@ with gr.Blocks() as demo:
     btn_refresh_cluster_dirs.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
         .then(
             stage_refresh_cluster_dirs,
-            inputs=[refresh_manifest_path, refresh_result_folder],
+            inputs=[refresh_manifest_path, refresh_result_folder, embeddings_cache_dir],
             outputs=[],
         ) \
         .then(lambda: enable_all(), outputs=all_buttons + [button_state])
+
+    btn_labeling_auto.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
+        .then(
+            labeling_action_auto,
+            inputs=[
+                refresh_manifest_path,
+                refresh_result_folder,
+                embeddings_cache_dir,
+                labeling_context_state,
+                labeling_embedding_cache_state,
+                labeling_current_cluster_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_state_outputs,
+        ) \
+        .then(
+            labeling_render,
+            inputs=[
+                labeling_context_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_status_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_render_outputs,
+        ) \
+        .then(lambda: enable_all(), outputs=all_buttons + [button_state])
+
+    btn_labeling_next.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
+        .then(
+            labeling_action_next,
+            inputs=[
+                refresh_manifest_path,
+                refresh_result_folder,
+                embeddings_cache_dir,
+                labeling_context_state,
+                labeling_embedding_cache_state,
+                labeling_current_cluster_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_state_outputs,
+        ) \
+        .then(
+            labeling_render,
+            inputs=[
+                labeling_context_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_status_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_render_outputs,
+        ) \
+        .then(lambda: enable_all(), outputs=all_buttons + [button_state])
+
+    btn_labeling_skip.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
+        .then(
+            labeling_action_skip,
+            inputs=[
+                refresh_manifest_path,
+                refresh_result_folder,
+                embeddings_cache_dir,
+                labeling_context_state,
+                labeling_embedding_cache_state,
+                labeling_current_cluster_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_state_outputs,
+        ) \
+        .then(
+            labeling_render,
+            inputs=[
+                labeling_context_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_status_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_render_outputs,
+        ) \
+        .then(lambda: enable_all(), outputs=all_buttons + [button_state])
+
+    btn_labeling_refresh.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
+        .then(
+            labeling_action_refresh,
+            inputs=[
+                refresh_manifest_path,
+                refresh_result_folder,
+                embeddings_cache_dir,
+                labeling_context_state,
+                labeling_embedding_cache_state,
+                labeling_current_cluster_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_state_outputs,
+        ) \
+        .then(
+            labeling_render,
+            inputs=[
+                labeling_context_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_status_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_render_outputs,
+        ) \
+        .then(lambda: enable_all(), outputs=all_buttons + [button_state])
+
+    btn_labeling_accept.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
+        .then(
+            labeling_action_accept,
+            inputs=[
+                refresh_manifest_path,
+                refresh_result_folder,
+                embeddings_cache_dir,
+                labeling_context_state,
+                labeling_embedding_cache_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+                labeling_status_state,
+            ],
+            outputs=labeling_state_outputs,
+        ) \
+        .then(
+            labeling_render,
+            inputs=[
+                labeling_context_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_status_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_render_outputs,
+        ) \
+        .then(lambda: enable_all(), outputs=all_buttons + [button_state])
+
+    btn_labeling_reject.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
+        .then(
+            labeling_action_reject,
+            inputs=[
+                labeling_context_state,
+                labeling_embedding_cache_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+                labeling_status_state,
+            ],
+            outputs=labeling_state_outputs,
+        ) \
+        .then(
+            labeling_render,
+            inputs=[
+                labeling_context_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_status_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_render_outputs,
+        ) \
+        .then(lambda: enable_all(), outputs=all_buttons + [button_state])
+
+    btn_labeling_confirm.click(lambda: disable_all(), outputs=all_buttons + [button_state]) \
+        .then(
+            labeling_action_confirm,
+            inputs=[
+                refresh_manifest_path,
+                refresh_result_folder,
+                embeddings_cache_dir,
+                labeling_context_state,
+                labeling_embedding_cache_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_existing_label,
+                labeling_new_label,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_state_outputs,
+        ) \
+        .then(
+            labeling_render,
+            inputs=[
+                labeling_context_state,
+                labeling_current_cluster_state,
+                labeling_recommendation_state,
+                labeling_review_state,
+                labeling_status_state,
+                labeling_skipped_state,
+                labeling_pending_state,
+            ],
+            outputs=labeling_render_outputs,
+        ) \
+        .then(lambda: gr.update(value=""), outputs=[labeling_new_label]) \
+        .then(lambda: enable_all(), outputs=all_buttons + [button_state])
+
+    demo.load(
+        labeling_render,
+        inputs=[
+            labeling_context_state,
+            labeling_current_cluster_state,
+            labeling_recommendation_state,
+            labeling_review_state,
+            labeling_status_state,
+            labeling_skipped_state,
+            labeling_pending_state,
+        ],
+        outputs=labeling_render_outputs,
+    )
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
